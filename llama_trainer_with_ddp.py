@@ -7,7 +7,7 @@ from tqdm import tqdm
 from logger import get_logger
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-from llama_model import Llama  # Import the Llama class
+from llama_model import get_model
 
 logger = get_logger(__name__)
 
@@ -66,7 +66,7 @@ def get_lr(it):
 def estimate_loss(model, ctx, eval_batches):
     model.eval()
     losses = torch.zeros(len(eval_batches))
-    for k, (X, Y, tasks) in enumerate(eval_batches):
+    for k, (X, Y) in enumerate(eval_batches):
         with ctx:
             logits, loss = model(X, Y)
         losses[k] = loss.item()
@@ -82,8 +82,7 @@ def train(model,
           block_size=1024,
           grad_accum_steps=16,
           eval_interval=200,
-          eval_steps=100,
-          audio_feature_dim=128):
+          eval_steps=100):
     
     print("moving model to", device)
     model.to(device)
@@ -105,12 +104,7 @@ def train(model,
     print("NUM TOTAL TOKENS:", (tokens_per_iter * steps)/(10**9), "Billion")
 
     scaler = torch.amp.GradScaler(enabled=(dtype == 'float16'))
-    
-    # Use Llama's built-in optimizer configuration method
-    optimizer = model.configure_optimizers(learning_rate=1e-1, 
-                                           lr_scheduler_fn=get_lr, 
-                                           weight_decay=0.1, 
-                                           device_type=device_type)
+    optimizer = model.configure_optimizers(1e-1, get_lr(0), (0.9, 0.95), device_type)
 
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
@@ -119,7 +113,7 @@ def train(model,
     local_iter_num = 0
 
     eval_batches = [get_batch('val', batch_size=batch_size, block_size=block_size, device=device) for i in range(eval_steps)]
-    X, Y, _ = get_batch('train', block_size=block_size, batch_size=batch_size, device=device)
+    X, Y = get_batch('train', block_size=block_size, batch_size=batch_size, device=device)
 
     all_losses = {}
 
@@ -137,10 +131,7 @@ def train(model,
             logger.info(f"Validation loss: {iter_num}, {losses}")
             all_losses['val'] = losses
             model_fname = f"{out_dir}/llama_{iter_num}.pt"
-            torch.save({
-                "model": raw_model.state_dict(), 
-                "config": raw_model.config if hasattr(raw_model, 'config') else {}
-            }, model_fname)
+            torch.save({"model": raw_model.state_dict(), "config": raw_model.config}, model_fname)
 
         for micro_step in range(grad_accum_steps):
             if ddp:
@@ -149,8 +140,7 @@ def train(model,
             with ctx:
                 logits, loss = model(X, Y)
                 loss = loss / grad_accum_steps
-            
-            X, Y, _ = get_batch('train', block_size=block_size, batch_size=batch_size, device=device)
+            X, Y = get_batch('train', block_size=block_size, batch_size=batch_size, device=device)
             scaler.scale(loss).backward()
 
         if grad_clip != 0.0:
@@ -168,17 +158,15 @@ def train(model,
         if master_process:
             lossf = loss.item() * grad_accum_steps
             all_losses['train'] = lossf
-            loss_string = f"train: {all_losses.get('train', 0):.4f} val: {all_losses.get('val', 0):.4f}"
+            loss_string = f"train: {all_losses['train']:.4f} val: {all_losses['val']:.4f}"
             pbar.set_description(loss_string)
-            pbar.update(1)
+            pbar.update(iter_num - pbar.n) 
         
+        iter_num += 1
         local_iter_num += 1
 
     model_fname = f"{out_dir}/llama_last.pt"
-    torch.save({
-        "model": raw_model.state_dict(), 
-        "config": raw_model.config if hasattr(raw_model, 'config') else {}
-    }, model_fname)
+    torch.save({"model": raw_model.state_dict(), "config": raw_model.config}, model_fname)
 
     if ddp:
         destroy_process_group()
@@ -191,22 +179,25 @@ def dummy_get_batch(split, block_size, batch_size, device):
     return X, Y
 
 if __name__ == '__main__':
-    llama_model = Llama.build(
-        ckpt_dir='path/to/checkpoint', 
-        tokenizer_path='path/to/tokenizer',  
-        max_seq_len=1024,
-        max_batch_size=64,
-        audio_feature_dim=128  # Pass audio feature dimension
+    model = get_model(
+        model_type='llama',
+        vocab_size=50257,
+        dropout=0.0,
+        max_seq_len=2048,
+        audio_feature_dim=128,
+        bias=False,
+        device='cuda',
+        compile=True,
+        path=None
     )
 
     train(
-        llama_model,
+        model,
         get_batch=dummy_get_batch,
         out_dir='out',
         steps=3000,
         block_size=1024,
         eval_interval=5,
         eval_steps=4,
-        batch_size=64,
-        audio_feature_dim=128
+        batch_size=64
     )
