@@ -1,8 +1,9 @@
-"Llama model for audio"
+"""
+Llama model for audio
+"""
 
 import os
-import glob
-import fire
+
 import time
 import json
 import math
@@ -320,8 +321,19 @@ class Transformer(nn.Module):
     
 class CompletionPrediction(TypedDict, total=False):
     generation: str
-    tokens: List[str]  # not required
-    logprobs: List[float]  # not required
+    tokens: List[str]  
+    logprobs: List[float]  
+
+@dataclass
+class LlamaConfig:
+    max_seq_len: int = 2048
+    vocab_size: int = 50257  # Adjust as necessary
+    n_layers: int = 32
+    n_heads: int = 32
+    dim: int = 4096
+    dropout: float = 0.0
+    bias: bool = True
+    audio_feature_dim: int = 128  # Example dimension for audio features
 
 class Llama:
 
@@ -494,203 +506,56 @@ class Llama:
                 for t, logprobs_i in zip(generation_tokens, generation_logprobs)
             ]
         return [{"generation": self.tokenizer.decode(t)} for t in generation_tokens]
-
+    
 def sample_top_p(probs, p):
-    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    mask = probs_sum - probs_sort > p
-    probs_sort[mask] = 0.0
-    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-    next_token = torch.multinomial(probs_sort, num_samples=1)
-    next_token = torch.gather(probs_idx, -1, next_token)
-    return next_token
-
-def _peek_data_shard(filename):
-    # only reads the header, returns header data
-    with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256*4), dtype=np.int32)
-    if header[0] != 20240801:
-        print("ERROR: magic number mismatch in the data .bin file!")
-        exit(1)
-    assert header[1] == 7, "unsupported version"
-    ntok = header[2] # number of tokens (claimed)
-    return ntok # for now just return the number of tokens
-
-def _load_data_shard(filename):
-    with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256*4), dtype=np.int32)
-        assert header[0] == 20240801, "magic number mismatch in the data .bin file"
-        assert header[1] == 7, "unsupported version"
-        ntok = header[2] # number of tokens (claimed)
-        # the rest of it are tokens, stored as uint16
-        tokens = np.frombuffer(f.read(), dtype=np.uint32)
-    assert len(tokens) == ntok, "number of tokens read does not match header?"
-    return tokens
-
-class DistributedDataLoader:
-    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
-        self.process_rank = process_rank
-        self.num_processes = num_processes
-        self.B = B
-        self.T = T
-
-        # glob files that match the pattern
-        self.files = sorted(glob.glob(filename_pattern))
-        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
-
-        # load and validate all data shards, count number of tokens in total
-        ntok_total = 0
-        for fname in self.files:
-            shard_ntok = _peek_data_shard(fname)
-            assert shard_ntok >= num_processes * B * T + 1
-            ntok_total += shard_ntok
-        self.ntok_total = ntok_total
-        print(f"DataLoader: total number of tokens: {ntok_total:,} across {len(self.files)} files")
-
-        # kick things off
-        self.current_shard = None
-        self.reset()
-
-    def reset(self):
-        # we're being a bit clever here: if we already had shard 0 loaded,
-        # then don't do the work to reload it, just reset the pointer
-        if self.current_shard != 0:
-            self.current_shard = 0
-            self.tokens = _load_data_shard(self.files[self.current_shard])
-        self.current_position = self.process_rank * self.B * self.T
-
-    def advance(self): # advance to next data shard
-        self.current_shard = (self.current_shard + 1) % len(self.files)
-        self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
-
-    def next_batch(self):
-        B = self.B
-        T = self.T
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
-        buf = torch.tensor(buf, dtype=torch.long)
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
-        # advance the start pointer in current shard
-        self.current_position += B * T * self.num_processes
-        # if loading the next batch would be out of bounds advance the shard
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.advance()
-        return x, y
-
-
-def reference(
-    ckpt_dir: str,
-    tokenizer_path: str,
-    temperature: float = 0.6,
-    top_p: float = 0.9,
-    max_seq_len: int = 128,
-    max_gen_len: int = 64,
-    max_batch_size: int = 4,
+        probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+        probs_sum = torch.cumsum(probs_sort, dim=-1)
+        mask = probs_sum - probs_sort > p
+        probs_sort[mask] = 0.0
+        probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+        next_token = torch.multinomial(probs_sort, num_samples=1)
+        next_token = torch.gather(probs_idx, -1, next_token)
+        return next_token
+    
+def get_model(
+    model_type='llama',
+    vocab_size=50257,
+    dropout=0.0,
+    max_seq_len=2048,
+    audio_feature_dim=128,
+    bias=False,
+    device='cpu',
+    compile=True,
+    path=None
 ):
+    config_args = {
+        'llama': dict(n_layers=32, n_heads=32, dim=4096),  
+    }[model_type]
 
-    llama = Llama.build(
-        ckpt_dir=ckpt_dir,
-        tokenizer_path=tokenizer_path,
+    model_args = dict(
         max_seq_len=max_seq_len,
-        max_batch_size=max_batch_size,
+        bias=bias,
+        vocab_size=vocab_size,
+        dropout=dropout,
+        audio_feature_dim=audio_feature_dim
     )
+    model_args.update(config_args)
 
-    prompts: List[str] = [
-        # For these prompts, the expected answer is the natural continuation of the prompt
-        "Clearly, the meaning of life is",
-        "Simply put, the theory of relativity states that",
-        """The repo llm.c on GitHub is""",
-        # Few shot prompt (providing a few examples before asking model to complete more);
-        """Translate English to French:
+    llama_config = LlamaConfig(**model_args)
 
-        sea otter => loutre de mer
-        peppermint => menthe poivrée
-        plush girafe => girafe peluche
-        cheese =>""",
-    ]
+    print("MODEL CONFIG: ", llama_config)
 
-    t0 = time.time()
-    results = llama.text_completion(
-        prompts,
-        max_gen_len=max_gen_len,
-        temperature=temperature,
-        top_p=top_p,
-    )
-    t1 = time.time()
-    print(f"Generated in {t1 - t0:.2f} seconds")
-    for prompt, result in zip(prompts, results):
-        print(prompt, end="") # AK: change end="\n" to end=""
-        print(f"{result['generation']}")
-        print("\n==================================\n")
+    model = Transformer(llama_config)
+    if path:
+        state_dict = torch.load(path, map_location=device)['model']
+        model.load_state_dict(state_dict)
 
-def finetune(
-    ckpt_dir: str,
-    tokenizer_path: str,
-    temperature: float = 1.0,
-    top_p: float = 0.9,
-    max_seq_len: int = 256,
-    max_gen_len: int = 256,
-    max_batch_size: int = 16,
-):
+    model.to(device)
+    if compile:
+        print("compiling the model... (takes a ~minute)")
+        torch.compile(model)
 
-    # load the val data shard
-    data_loader = DistributedDataLoader(
-        filename_pattern="tinystories/*_val.bin",
-        B=max_batch_size,
-        T=max_seq_len,
-        process_rank=0,
-        num_processes=1,
-    )
+    return model
 
-    llama = Llama.build(
-        ckpt_dir=ckpt_dir,
-        tokenizer_path=tokenizer_path,
-        max_seq_len=max_seq_len,
-        max_batch_size=max_batch_size,
-    )
 
-    total_batch_size = max_batch_size * max_seq_len
-    print(f"total_batch_size: {total_batch_size}")
 
-    # super simple training loop to start
-    model = llama.model
-    model.train()
-    optimizer = model.configure_optimizers(learning_rate=1e-4, weight_decay=0.0)
-    for step in range(20):
-        optimizer.zero_grad()
-        x, y = data_loader.next_batch()
-        x, y = x.cuda(), y.cuda()
-        loss = model.forward_loss(x, y)
-        loss.backward()
-        optimizer.step()
-        print(f"step {step}, loss: {loss.item()}")
-
-    # and now generate
-    model.eval()
-    prompts: List[str] = [
-        "Once upon a time",
-        "One day",
-        "Lily and George were best friends",
-        "On a dark and stormy night",
-    ]
-
-    t0 = time.time()
-    results = llama.text_completion(
-        prompts,
-        max_gen_len=max_gen_len,
-        temperature=temperature,
-        top_p=top_p,
-    )
-    t1 = time.time()
-    print(f"Generated in {t1 - t0:.2f} seconds")
-    for prompt, result in zip(prompts, results):
-        print(prompt, end="") # AK: change end="\n" to end=""
-        print(f"{result['generation']}")
-        print("\n==================================\n")
-
-if __name__ == "__main__":
-    fire.Fire(reference)
-    # fire.Fire(finetune)
