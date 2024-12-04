@@ -324,17 +324,6 @@ class CompletionPrediction(TypedDict, total=False):
     tokens: List[str]  
     logprobs: List[float]  
 
-@dataclass
-class LlamaConfig:
-    max_seq_len: int = 2048
-    vocab_size: int = 50257  # Adjust as necessary
-    n_layers: int = 32
-    n_heads: int = 32
-    dim: int = 4096
-    dropout: float = 0.0
-    bias: bool = True
-    audio_feature_dim: int = 128  # Example dimension for audio features
-
 class Llama:
 
     @staticmethod
@@ -541,7 +530,7 @@ def get_model(
     )
     model_args.update(config_args)
 
-    llama_config = LlamaConfig(**model_args)
+    llama_config = ModelArgs(**model_args)
 
     print("MODEL CONFIG: ", llama_config)
 
