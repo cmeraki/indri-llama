@@ -339,9 +339,12 @@ def get_model(
     print("MODEL CONFIG: ", llama_config)
 
     model = Transformer(llama_config)
+    
     if path:
         state_dict = torch.load(path, map_location=device)['model']
         model.load_state_dict(state_dict)
+    else:
+        raise ValueError("Path to the LLaMA 3.1 1Bn model checkpoint must be provided")
 
     model.to(device)
     if compile:

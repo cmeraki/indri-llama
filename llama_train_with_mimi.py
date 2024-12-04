@@ -188,7 +188,6 @@ def train_text_semantic(dataset_dirs):
     out_dir = Path(f'{CACHE_DIR}/models/mimi_all_770m/')
     data_generator = DataLoader(datasets_dirs=dataset_dirs, maxfiles=2000000)
     taskgen = TaskGenerator(loader=data_generator)
-    pretrained = 'cmeraki/gpt2-124M-400B'
     vocab_size = cfg.VOCAB_SIZE
     model = get_model(model_type='llama', vocab_size=vocab_size)
     model.expand_vocab(new_vocab_size=vocab_size)
@@ -196,7 +195,7 @@ def train_text_semantic(dataset_dirs):
     logger.info(f"Vocab size: {vocab_size}")
     logger.info(f"Model outdir: {out_dir}")
     logger.info("Training text sem".upper())
-    llama_train(model, get_batch=taskgen.get_batch, out_dir=out_dir, steps=350000, block_size=1024, eval_interval=5000, batch_size=12, grad_accum_steps=8)
+    llama_train(model, get_batch=taskgen.get_batch, out_dir=out_dir, steps=350000, block_size=1024, eval_interval=5000, batch_size=2, grad_accum_steps=32)
 
 if __name__ == '__main__':
     from argparse import ArgumentParser

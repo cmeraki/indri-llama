@@ -8,6 +8,7 @@ from logger import get_logger
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from llama_model import get_model
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 logger = get_logger(__name__)
 
@@ -178,7 +179,15 @@ def dummy_get_batch(split, block_size, batch_size, device):
     Y = torch.ones(batch_size, block_size, dtype=torch.long).to(device)
     return X, Y
 
+def download_model(model_name):
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model.save_pretrained('~/.cache/huggingface/transformers')
+    tokenizer.save_pretrained('~/.cache/huggingface/transformers')
+    return '~/.cache/huggingface/transformers'
+
 if __name__ == '__main__':
+    model_path = download_model('huggingface/llama')
     model = get_model(
         model_type='llama',
         vocab_size=50257,
@@ -186,9 +195,9 @@ if __name__ == '__main__':
         max_seq_len=2048,
         audio_feature_dim=128,
         bias=False,
-        device='cuda',
+        device='cuda',  # or 'cpu'
         compile=True,
-        path=None
+        path=model_path
     )
 
     train(
@@ -199,5 +208,6 @@ if __name__ == '__main__':
         block_size=1024,
         eval_interval=5,
         eval_steps=4,
-        batch_size=64
+        batch_size=2,
+        grad_accum_steps=32
     )
