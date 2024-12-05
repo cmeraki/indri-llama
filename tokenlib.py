@@ -6,10 +6,23 @@ from transformers import MimiModel, AutoFeatureExtractor, AutoTokenizer
 
 from commons import TEXT, MIMI
 
-class TextTokenizer:
+'''class TextTokenizer:
     def __init__(self, name='cmeraki/gpt2-124M-400B'):
         self.type = TEXT
         self.tokenizer = AutoTokenizer.from_pretrained(name)
+        print("text vocab size", self.tokenizer.vocab_size)
+
+    def encode(self, text: str):
+        tokens = self.tokenizer.encode(text)
+        return tokens
+
+    def decode(self, tokens):
+        return self.tokenizer.decode(tokens)'''
+    
+class LLamaTokenizer:
+    def __init__(self, name='llama_tokenizer'):
+        self.type = TEXT
+        self.tokenizer = AutoTokenizer.from_pretrained(name, legacy=False)
         print("text vocab size", self.tokenizer.vocab_size)
 
     def encode(self, text: str):
@@ -75,7 +88,7 @@ def get_tokenizer(type, device):
         tokenizer = MimiTokenizer(device=device)
 
     if type == TEXT:
-        tokenizer = TextTokenizer()
+        tokenizer = LLamaTokenizer()
 
     return tokenizer
 
