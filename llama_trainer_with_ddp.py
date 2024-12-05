@@ -187,7 +187,7 @@ def download_model(model_name):
     return '~/.cache/huggingface/transformers'
 
 if __name__ == '__main__':
-    model_path = download_model('meta-llama/Llama-3.1-8B')
+    model_path = download_model('meta-llama/Llama-3.2-1B')
     model = get_model(
         model_type='llama',
         vocab_size=50257,
