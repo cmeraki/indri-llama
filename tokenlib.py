@@ -20,7 +20,7 @@ from commons import TEXT, MIMI
         return self.tokenizer.decode(tokens)'''
     
 class LLamaTokenizer:
-    def __init__(self, name='llama_tokenizer'):
+    def __init__(self, name='Llama_tokenizer'):
         self.type = TEXT
         self.tokenizer = AutoTokenizer.from_pretrained(name, legacy=False)
         print("text vocab size", self.tokenizer.vocab_size)

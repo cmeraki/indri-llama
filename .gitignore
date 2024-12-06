@@ -3,3 +3,5 @@ logs/
 tokenizer/
 ~/.cache/
 Llama_tokenizer/
+oldtokenizer/
+tts_tokenizer/
