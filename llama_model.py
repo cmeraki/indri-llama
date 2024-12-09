@@ -312,7 +312,7 @@ class Transformer(nn.Module):
 
 def get_model(
     model_type='llama',
-    vocab_size=50257,
+    vocab_size=144448,
     dropout=0.0,
     max_seq_len=2048,
     audio_feature_dim=128,
