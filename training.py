@@ -4,12 +4,13 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 import pickle
 import numpy as np
-from llama_model import get_model  
+from llama_model import get_model
+import gc
 
 class TrainingConfig:
     def __init__(
         self, 
-        batch_size=32, 
+        batch_size=16,  
         grad_accumulation_steps=4,
         learning_rate=1e-4, 
         weight_decay=0.01,
@@ -43,24 +44,24 @@ def prepare_data(pkl_path, test_split=0.1, val_split=0.1):
     with open(pkl_path, 'rb') as f:
         all_tokens = pickle.load(f)
     
-    if not isinstance(all_tokens, torch.Tensor):
-        all_tokens = torch.tensor(all_tokens, dtype=torch.long)
+    all_tokens = torch.tensor(all_tokens, dtype=torch.long, device='cpu')
     
     total_size = len(all_tokens)
     test_size = int(total_size * test_split)
     val_size = int(total_size * val_split)
     train_size = total_size - test_size - val_size
     
-    train_data, val_data, test_data = random_split(
-        all_tokens, 
-        [train_size, val_size, test_size],
-        generator=torch.Generator().manual_seed(42)
-    )
+    torch.manual_seed(42)
+    indices = torch.randperm(total_size)
+    
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size:train_size+val_size]
+    test_indices = indices[train_size+val_size:]
     
     return {
-        'train': AudioTokenDataset(train_data),
-        'val': AudioTokenDataset(val_data),
-        'test': AudioTokenDataset(test_data)
+        'train': AudioTokenDataset(all_tokens[train_indices]),
+        'val': AudioTokenDataset(all_tokens[val_indices]),
+        'test': AudioTokenDataset(all_tokens[test_indices])
     }
 
 def create_batch_collate(start_token=128000, audio_start_token=144461, stop_token=144644):
@@ -84,7 +85,6 @@ def create_batch_collate(start_token=128000, audio_start_token=144461, stop_toke
                 continue
             
             input_seq = sequence[:audio_start_idx+1]
-            
             target_seq = sequence[audio_start_idx+1:stop_idx]
             
             processed_sequences.append(input_seq)
@@ -107,15 +107,7 @@ def create_batch_collate(start_token=128000, audio_start_token=144461, stop_toke
     return collate_fn
 
 def create_learning_rate_scheduler(optimizer, config):
-    """
-    Create a learning rate scheduler with warmup
-    """
-    def lr_lambda(current_step: int):
-        if current_step < config.warmup_steps:
-            return float(current_step) / float(max(1, config.warmup_steps))
-        return 1.0  
-    
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    return torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.1)
 
 def train_model(
     model, 
@@ -123,7 +115,6 @@ def train_model(
     config: TrainingConfig, 
     device
 ):
-    
     best_val_loss = float('inf')
     
     optimizer = torch.optim.AdamW(
@@ -137,15 +128,19 @@ def train_model(
     global_step = 0
     
     for epoch in range(config.epochs):
+        torch.cuda.empty_cache()
+        gc.collect()
+        
         model.train()
         train_loss = 0.0
         optimizer.zero_grad()
         
         for batch_idx, (input_features, targets) in enumerate(dataloaders['train']):
-            input_features = input_features.to(device)
-            targets = targets.to(device)
+            input_features = input_features.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
             
-            loss = model.forward_loss(input_features, targets)
+            with torch.cuda.amp.autocast(enabled=True):
+                loss = model.forward_loss(input_features, targets)
             
             loss = loss / config.grad_accumulation_steps
             
@@ -162,18 +157,25 @@ def train_model(
             
             train_loss += loss.item()
             
+            del input_features, targets, loss
+            torch.cuda.empty_cache()
+            
             if batch_idx % config.log_interval == 0:
-                print(f'Epoch {epoch}, Batch {batch_idx}, Train Loss: {loss.item():.4f}')
+                print(f'Epoch {epoch}, Batch {batch_idx}, Train Loss: {train_loss:.4f}')
         
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
             for input_features, targets in dataloaders['val']:
-                input_features = input_features.to(device)
-                targets = targets.to(device)
+                input_features = input_features.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
                 
                 loss = model.forward_loss(input_features, targets)
                 val_loss += loss.item()
+                
+                # Clear GPU memory
+                del input_features, targets, loss
+                torch.cuda.empty_cache()
         
         train_loss /= len(dataloaders['train'])
         val_loss /= len(dataloaders['val'])
@@ -194,20 +196,21 @@ def train_model(
 
 def main():
     config = TrainingConfig(
-        batch_size=2,  
-        grad_accumulation_steps=16,
+        batch_size=2, 
+        grad_accumulation_steps=64,
         learning_rate=1e-4,
         epochs=1000
     )
     
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    model = get_model(
-        model_type='llama',
-        path='Llama_tokenizer/model.safetensors',
-        device=str(DEVICE),
-        audio_feature_dim=128  
-    )
+    with torch.cuda.amp.autocast(enabled=True):
+        model = get_model(
+            model_type='llama',
+            path='Llama_tokenizer/model.safetensors',
+            device=str(DEVICE),
+            audio_feature_dim=128  
+        )
     model.to(DEVICE)
     
     datasets = prepare_data('tokens/lj_speech_tokens.pkl')
@@ -217,21 +220,27 @@ def main():
             datasets['train'], 
             batch_size=config.batch_size, 
             shuffle=True, 
-            collate_fn=create_batch_collate()
+            collate_fn=create_batch_collate(),
+            pin_memory=True, 
+            num_workers=2     
         ),
         'val': DataLoader(
             datasets['val'], 
             batch_size=config.batch_size, 
             shuffle=False, 
-            collate_fn=create_batch_collate()
+            collate_fn=create_batch_collate(),
+            pin_memory=True
         ),
         'test': DataLoader(
             datasets['test'], 
             batch_size=config.batch_size, 
             shuffle=False, 
-            collate_fn=create_batch_collate()
+            collate_fn=create_batch_collate(),
+            pin_memory=True
         )
     }
+    
+    model.gradient_checkpointing_enable()
     
     trained_model = train_model(
         model, 
