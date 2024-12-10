@@ -50,24 +50,24 @@ class TokenDataset(data.Dataset):
         
         return inputs, targets
 
-def pad_collate_fn(batch):
+def pad_collate_fn(batch, max_input_len=2048, max_target_len=2048):
     inputs, targets = zip(*batch)
 
-    max_input_len = max(len(seq) for seq in inputs)
     padded_inputs = torch.full((len(inputs), max_input_len), fill_value=0, dtype=torch.int32)
     input_masks = torch.zeros((len(inputs), max_input_len), dtype=torch.bool)
     
     for i, seq in enumerate(inputs):
-        padded_inputs[i, :len(seq)] = seq
-        input_masks[i, :len(seq)] = 1
+        seq_len = min(len(seq), max_input_len)
+        padded_inputs[i, :seq_len] = seq[:seq_len]
+        input_masks[i, :seq_len] = 1
 
-    max_target_len = max(len(seq) for seq in targets)
     padded_targets = torch.full((len(targets), max_target_len), fill_value=0, dtype=torch.int32)
     target_masks = torch.zeros((len(targets), max_target_len), dtype=torch.bool)
     
     for i, seq in enumerate(targets):
-        padded_targets[i, :len(seq)] = seq
-        target_masks[i, :len(seq)] = 1
+        seq_len = min(len(seq), max_target_len)
+        padded_targets[i, :seq_len] = seq[:seq_len]
+        target_masks[i, :seq_len] = 1
 
     return padded_inputs, padded_targets, input_masks, target_masks
 
@@ -168,15 +168,15 @@ def main():
         train_dataset, 
         batch_size=32, 
         shuffle=True, 
-        collate_fn=pad_collate_fn,
+        collate_fn=lambda batch: pad_collate_fn(batch, max_input_len=512, max_target_len=512),
         num_workers=4,  
         pin_memory=True  
-    )
+)
     val_loader = data.DataLoader(
         val_dataset, 
         batch_size=32, 
         shuffle=False, 
-        collate_fn=pad_collate_fn,
+        collate_fn=lambda batch: pad_collate_fn(batch, max_input_len=512, max_target_len=512),
         num_workers=4,
         pin_memory=True
     )
@@ -184,7 +184,7 @@ def main():
         test_dataset, 
         batch_size=32, 
         shuffle=False, 
-        collate_fn=pad_collate_fn,
+        collate_fn=lambda batch: pad_collate_fn(batch, max_input_len=512, max_target_len=512),
         num_workers=4,
         pin_memory=True
     )
@@ -194,7 +194,7 @@ def main():
     
     config = LlamaConfig(
         vocab_size=max(max(seq) for seq in tokens) + 1,  
-        dim=1024, 
+        dim=2048, 
         n_layers=12, 
         n_heads=16
     )

@@ -174,18 +174,19 @@ class Attention(nn.Module):
         keys = repeat_kv(keys, self.n_rep)
         values = repeat_kv(values, self.n_rep)
 
-        xq = xq.transpose(1, 2)
-        keys = keys.transpose(1, 2)
-        values = values.transpose(1, 2)
+        xq = xq.transpose(1, 2).reshape(bsz * self.n_heads, seqlen, self.head_dim)
+        keys = keys.transpose(1, 2).reshape(bsz * self.n_heads, seqlen, self.head_dim)
+        values = values.transpose(1, 2).reshape(bsz * self.n_heads, seqlen, self.head_dim)
         
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        scores = torch.matmul(xq, keys.transpose(1, 2)) / math.sqrt(self.head_dim)
         if mask is not None:
-            scores = scores + mask[:, None, None, :seqlen]
+            mask = mask.unsqueeze(1).repeat(1, self.n_heads, 1, 1)
+            scores = scores + mask[:, :, :seqlen, :seqlen]
         
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)
         
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        output = output.view(bsz, self.n_heads, seqlen, self.head_dim).transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
 class FeedForward(nn.Module):
@@ -515,7 +516,7 @@ def get_model(
         ),
         'llama-1b': dict(
             n_layers=12,
-            dim=1024,  
+            dim=2048,  
             n_heads=16,   
             rope_theta=10000.0,
             norm_eps=1e-5,
