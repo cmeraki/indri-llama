@@ -29,7 +29,7 @@ class TokenDataset(data.Dataset):
         return len(self.tokens)
 
     def __getitem__(self, idx):
-        seq = torch.tensor(self.tokens[idx].clone().detach(), dtype=torch.int32)
+        seq = torch.tensor(self.tokens[idx], dtype=torch.int32)
         
         task_token_idx = torch.where(seq == 144642)[0]
         speaker_token_idx = torch.where(seq == 144645)[0]
@@ -50,31 +50,31 @@ class TokenDataset(data.Dataset):
         
         return inputs, targets
 
-def pad_collate_fn(batch, max_input_len=2048, max_target_len=2048):
+def pad_collate_fn(batch):
     inputs, targets = zip(*batch)
 
+    max_input_len = max(len(seq) for seq in inputs)
     padded_inputs = torch.full((len(inputs), max_input_len), fill_value=0, dtype=torch.int32)
     input_masks = torch.zeros((len(inputs), max_input_len), dtype=torch.bool)
     
     for i, seq in enumerate(inputs):
-        seq_len = min(len(seq), max_input_len)
-        padded_inputs[i, :seq_len] = seq[:seq_len]
-        input_masks[i, :seq_len] = 1
+        padded_inputs[i, :len(seq)] = seq
+        input_masks[i, :len(seq)] = 1
 
+    max_target_len = max(len(seq) for seq in targets)
     padded_targets = torch.full((len(targets), max_target_len), fill_value=0, dtype=torch.int32)
     target_masks = torch.zeros((len(targets), max_target_len), dtype=torch.bool)
     
     for i, seq in enumerate(targets):
-        seq_len = min(len(seq), max_target_len)
-        padded_targets[i, :seq_len] = seq[:seq_len]
-        target_masks[i, :seq_len] = 1
+        padded_targets[i, :len(seq)] = seq
+        target_masks[i, :len(seq)] = 1
 
     return padded_inputs, padded_targets, input_masks, target_masks
 
 def train_model(model, train_loader, val_loader, optimizer, criterion, device, num_epochs=10, scheduler=None):
     best_val_loss = float('inf')
-    accumulation_steps = 4  
-    scaler = torch.amp.GradScaler('cpu')
+    accumulation_steps = 64
+    scaler = torch.cuda.amp.GradScaler(device)
 
     for epoch in range(num_epochs):
         model.train()
@@ -87,7 +87,7 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, device, n
             input_masks = input_masks.to(device)
             target_masks = target_masks.to(device)
 
-            with torch.amp.autocast('cpu'):
+            with torch.cuda.amp.autocast():
                 outputs = model(inputs, attention_mask=input_masks)
                 
                 loss = criterion(
@@ -109,6 +109,7 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, device, n
 
             total_train_loss += loss.item() * accumulation_steps
 
+
         model.eval()
         total_val_loss = 0
         with torch.no_grad():
@@ -118,7 +119,7 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, device, n
                 input_masks = input_masks.to(device)
                 target_masks = target_masks.to(device)
 
-                with torch.amp.autocast('cpu'):
+                with torch.cuda.amp.autocast():
                     outputs = model(inputs, attention_mask=input_masks)
                     val_loss = criterion(
                         outputs.view(-1, outputs.size(-1))[target_masks.view(-1)], 
@@ -126,6 +127,7 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, device, n
                     )
                 
                 total_val_loss += val_loss.item()
+
 
         avg_train_loss = total_train_loss / len(train_loader)
         avg_val_loss = total_val_loss / len(val_loader)
@@ -164,25 +166,25 @@ def main():
 
     train_loader = data.DataLoader(
         train_dataset, 
-        batch_size=32, 
+        batch_size=4, 
         shuffle=True, 
-        collate_fn=lambda batch: pad_collate_fn(batch, max_input_len=512, max_target_len=512),
+        collate_fn=pad_collate_fn,
         num_workers=4,  
         pin_memory=True  
     )
     val_loader = data.DataLoader(
         val_dataset, 
-        batch_size=32, 
+        batch_size=4, 
         shuffle=False, 
-        collate_fn=lambda batch: pad_collate_fn(batch, max_input_len=512, max_target_len=512),
+        collate_fn=pad_collate_fn,
         num_workers=4,
         pin_memory=True
     )
     test_loader = data.DataLoader(
         test_dataset, 
-        batch_size=32, 
+        batch_size=4, 
         shuffle=False, 
-        collate_fn=lambda batch: pad_collate_fn(batch, max_input_len=512, max_target_len=512),
+        collate_fn=pad_collate_fn,
         num_workers=4,
         pin_memory=True
     )
@@ -192,7 +194,7 @@ def main():
     
     config = LlamaConfig(
         vocab_size=max(max(seq) for seq in tokens) + 1,  
-        dim=2048, 
+        dim=1024, 
         n_layers=12, 
         n_heads=16
     )
