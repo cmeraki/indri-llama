@@ -272,28 +272,8 @@ class Llama(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward_inference(self, tokens: torch.Tensor, start_pos: int, attention_mask: Optional[torch.Tensor] = None):
-        _bsz, seqlen = tokens.shape
-        h = self.tok_embeddings(tokens)
-        self.freqs_cis = self.freqs_cis.to(h.device)
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
-
-        mask = None
-        if seqlen > 1:
-            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
-            mask = torch.triu(mask, diagonal=1)
-            mask = torch.hstack(
-                [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
-            ).type_as(h)
-
-        if attention_mask is not None:
-            mask = mask + attention_mask[:, None, None, :seqlen]
-
-        for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
-        h = self.norm(h)
-        output = self.output(h).float()
-        return output
+    def forward(self, inputs: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
+        return self.forward_loss(inputs, inputs, attention_mask=attention_mask)
 
     def forward_loss(self, inputs: torch.Tensor, targets: torch.Tensor, ignore_index=-100, attention_mask: Optional[torch.Tensor] = None):
         inputs = inputs.to(self.tok_embeddings.weight.device)
@@ -368,31 +348,25 @@ class Llama(nn.Module):
         """
         from transformers import LlamaForCausalLM
 
-        # Define model configurations (example, adjust as needed)
         config_args = {
             'llama-7b': dict(n_layers=32, dim=4096, n_heads=32),
             'llama-13b': dict(n_layers=40, dim=5120, n_heads=40),
             'llama-33b': dict(n_layers=60, dim=6656, n_heads=52),
             'llama-1b': dict(n_layers=12, dim=1024, n_heads=16),
-            # Add more model types as needed
         }
 
         assert model_type in config_args, f"Unsupported model type: {model_type}"
 
-        # Create configuration
-        config_args[model_type]['vocab_size'] = 32000  # Typical Llama vocab size
-        config_args[model_type]['max_seq_len'] = 2048  # Typical sequence length
+        config_args[model_type]['vocab_size'] = 32000  
+        config_args[model_type]['max_seq_len'] = 2048  
         config = LlamaConfig(**config_args[model_type])
 
-        # Create model
         model = cls(config)
 
-        # Load HuggingFace model
         model_hf = LlamaForCausalLM.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
         sd = model.state_dict()
 
-        # Mapping and copying weights (simplified, may need adjustments)
         for k, v in sd_hf.items():
             if k in sd:
                 sd[k].copy_(v)
@@ -453,6 +427,55 @@ class Llama(nn.Module):
         self.config.vocab_size = new_vocab_size
         self.vocab_size = new_vocab_size
 
+    @torch.inference_mode()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, stop_token=None):
+        start_pos = 0
+        for _ in range(max_new_tokens):
+            idx_cond = idx if idx.size(1) <= self.config.max_seq_len else idx[:, -self.config.max_seq_len:]           
+            logits = self.forward_inference(idx_cond, start_pos)            
+            logits = logits[:, -1, :] / temperature
+            
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            
+            probs = F.softmax(logits, dim=-1)
+            
+            idx_next = torch.multinomial(probs, num_samples=1)
+
+            if stop_token is not None and idx_next == stop_token:
+                break
+
+            idx = torch.cat((idx, idx_next), dim=1)
+            start_pos += 1
+
+        return idx
+
+    def expand_vocab(self, new_vocab_size):
+        print(f"Updating embeddings {self.vocab_size, self.config.dim} => {new_vocab_size, self.config.dim}")
+        
+        old_embeddings = self.tok_embeddings.weight
+        new_embeddings = torch.Tensor(new_vocab_size, self.config.dim).to(old_embeddings.device)
+
+        mu = torch.mean(old_embeddings, dim=0)
+        sigma = ((old_embeddings - mu).T @ (old_embeddings - mu)) / self.vocab_size
+        dist = torch.distributions.multivariate_normal.MultivariateNormal(
+            mu, covariance_matrix=1e-5 * sigma)
+
+        new_embeddings[:self.vocab_size] = self.tok_embeddings.weight
+        new_embeddings[self.vocab_size:] = torch.stack(
+            tuple((dist.sample() for _ in range(new_vocab_size - self.vocab_size))), 
+            dim=0
+        )
+
+        self.tok_embeddings = nn.Embedding(_weight=new_embeddings, 
+                                           num_embeddings=new_vocab_size, 
+                                           embedding_dim=self.config.dim)
+        self.output = nn.Linear(self.config.dim, new_vocab_size, bias=False)
+        self.output.weight = self.tok_embeddings.weight
+
+        self.config.vocab_size = new_vocab_size
+        self.vocab_size = new_vocab_size
 
 def get_model(
         model_type='llama-1b',
@@ -528,11 +551,9 @@ def get_model(
 
     model = Llama(llamaconf)
 
-    # Load weights if path is provided
     if path:
         state_dict = checkpoint['model']
         
-        # Remove any unwanted prefixes (common in distributed training)
         unwanted_prefix = '_orig_mod.'
         for k, v in list(state_dict.items()):
             if k.startswith(unwanted_prefix):
