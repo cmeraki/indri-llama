@@ -491,11 +491,13 @@ def get_model(
         dropout=0.0,
         max_seq_len=2048,
         bias=False,
-        device='cpu',
+        device=None,
         compile=True,
         path=None
     ):
-
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
     config_args = {
         'llama-7b': dict(
             n_layers=32, 
