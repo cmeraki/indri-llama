@@ -180,7 +180,7 @@ class Attention(nn.Module):
         
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
-            scores = scores + mask
+            scores = scores + mask[:, None, None, :seqlen]
         
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)
@@ -272,7 +272,7 @@ class Llama(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward_inference(self, tokens: torch.Tensor, start_pos: int):
+    def forward_inference(self, tokens: torch.Tensor, start_pos: int, attention_mask: Optional[torch.Tensor] = None):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
@@ -286,13 +286,16 @@ class Llama(nn.Module):
                 [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
             ).type_as(h)
 
+        if attention_mask is not None:
+            mask = mask + attention_mask[:, None, None, :seqlen]
+
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)
         output = self.output(h).float()
         return output
 
-    def forward_loss(self, inputs: torch.Tensor, targets: torch.Tensor, ignore_index=-100):
+    def forward_loss(self, inputs: torch.Tensor, targets: torch.Tensor, ignore_index=-100, attention_mask: Optional[torch.Tensor] = None):
         inputs = inputs.to(self.tok_embeddings.weight.device)
         targets = targets.to(self.tok_embeddings.weight.device)
 
@@ -306,6 +309,9 @@ class Llama(nn.Module):
         mask = torch.triu(mask, diagonal=1)
         mask = mask.type_as(h)
         
+        if attention_mask is not None:
+            mask = mask + attention_mask[:, None, None, :seqlen]
+
         start_pos = 0
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
