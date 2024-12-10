@@ -182,14 +182,15 @@ def main():
 
     tokens_file = 'tokens/lj_speech_tokens.pkl'  
     vocab_size = 144645  
-    
+    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+
     model = get_model(
         model_type='llama',
         vocab_size=vocab_size,
         dropout=0.1,
         max_seq_len=2048,
         bias=False,
-        device='cuda'
+        device=device
     )
 
     trainer = MultimodalTrainer(
