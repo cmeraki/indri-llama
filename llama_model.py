@@ -83,7 +83,7 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled:
     if use_scaled:
         freqs = apply_scaling(freqs)
     freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  
     return freqs_cis
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
@@ -293,30 +293,46 @@ class Llama(nn.Module):
         return output
 
     def forward_loss(self, inputs: torch.Tensor, targets: torch.Tensor, ignore_index=-100):
-        _bsz, seqlen = inputs.shape
-        h = self.tok_embeddings(inputs)
-        self.freqs_cis = self.freqs_cis.to(h.device)
-        freqs_cis = self.freqs_cis[:seqlen]
-        mask = torch.full((seqlen, seqlen), float("-inf"), device=inputs.device)
+        inputs = inputs.to(self.tok_embeddings.weight.device)
+        targets = targets.to(self.tok_embeddings.weight.device)
+
+        _bsz, seqlen = inputs.shape        
+        h = self.tok_embeddings(inputs)        
+        if not hasattr(self, 'freqs_cis') or self.freqs_cis is None:           
+            self.freqs_cis = self.precompute_freqs_cis(seqlen, h.size(-1)).to(h.device)
+        
+        freqs_cis = self.freqs_cis[:seqlen].to(h.device)        
+        mask = torch.full((seqlen, seqlen), float("-inf"), device=h.device)
         mask = torch.triu(mask, diagonal=1)
         mask = mask.type_as(h)
-        start_pos = -1 
+        
+        start_pos = 0
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
+        
         h = self.norm(h)
         logits = self.output(h).float()
+        
         loss = F.cross_entropy(
-            input=logits.transpose(1, 2), target=targets, ignore_index=ignore_index)
+            input=logits.view(-1, logits.size(-1)), 
+            target=targets.view(-1), 
+            ignore_index=ignore_index
+        )
+        
         return loss
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def precompute_freqs_cis(self, max_seq_len, dim, base=10000.0):
+        freqs = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_seq_len).float()
+        freqs = torch.outer(t, freqs)
         
-        # start with all of the candidate parameters
+        emb = torch.cat([freqs.sin(), freqs.cos()], dim=-1)
+        
+        return emb
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):        
         param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        
-        # create optim groups. Separate weight decay for 2D params
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}        
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
         
@@ -325,7 +341,6 @@ class Llama(nn.Module):
             {'params': nodecay_params, 'weight_decay': 0.0}
         ]
         
-        # Print parameter information
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
