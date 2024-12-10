@@ -74,7 +74,7 @@ def pad_collate_fn(batch, max_input_len=2048, max_target_len=2048):
 def train_model(model, train_loader, val_loader, optimizer, criterion, device, num_epochs=10, scheduler=None):
     best_val_loss = float('inf')
     accumulation_steps = 4  
-    scaler = torch.amp.GradScaler(device)
+    scaler = torch.amp.GradScaler('cpu')
 
     for epoch in range(num_epochs):
         model.train()
@@ -87,7 +87,7 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, device, n
             input_masks = input_masks.to(device)
             target_masks = target_masks.to(device)
 
-            with torch.amp.autocast(device):
+            with torch.amp.autocast('cpu'):
                 outputs = model(inputs, attention_mask=input_masks)
                 
                 loss = criterion(
@@ -118,7 +118,7 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, device, n
                 input_masks = input_masks.to(device)
                 target_masks = target_masks.to(device)
 
-                with torch.amp.autocast(device):
+                with torch.amp.autocast('cpu'):
                     outputs = model(inputs, attention_mask=input_masks)
                     val_loss = criterion(
                         outputs.view(-1, outputs.size(-1))[target_masks.view(-1)], 
