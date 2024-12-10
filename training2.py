@@ -4,7 +4,7 @@ import torch.optim as optim
 import torch.utils.data as data
 import pickle
 from sklearn.model_selection import train_test_split
-from llama_model import Llama, LlamaConfig  
+from llama_model import Llama, LlamaConfig
 
 def load_data(file_path):
     with open(file_path, 'rb') as f:
@@ -21,17 +21,29 @@ class TokenDataset(data.Dataset):
     def __getitem__(self, idx):
         return self.tokens[idx]
 
+def pad_collate_fn(batch):
+    max_len = max(len(seq) for seq in batch)
+    
+    padded_batch = torch.full((len(batch), max_len), fill_value=-100, dtype=torch.int32)
+    
+    for i, seq in enumerate(batch):
+        padded_batch[i, :len(seq)] = torch.tensor(seq, dtype=torch.int32)
+    
+    return padded_batch
+
 def train_model(model, train_loader, optimizer, criterion, device, num_epochs=10):
     model.train()
-    scaler = torch.cuda.amp.GradScaler()  
+    scaler = torch.amp.GradScaler('cuda')  
     for epoch in range(num_epochs):
         total_loss = 0
         for batch in train_loader:
             batch = batch.to(device)
             optimizer.zero_grad()
+            
             with torch.cuda.amp.autocast():  
                 outputs = model.forward_loss(batch[:, :-1], batch[:, 1:])
                 loss = criterion(outputs, batch[:, 1:])
+            
             scaler.scale(loss).backward()  
             scaler.step(optimizer)  
             scaler.update()  
@@ -49,9 +61,9 @@ def main():
     val_dataset = TokenDataset(val_tokens)
     test_dataset = TokenDataset(test_tokens)
 
-    train_loader = data.DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = data.DataLoader(val_dataset, batch_size=32, shuffle=False)
-    test_loader = data.DataLoader(test_dataset, batch_size=32, shuffle=False)
+    train_loader = data.DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=pad_collate_fn)
+    val_loader = data.DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=pad_collate_fn)
+    test_loader = data.DataLoader(test_dataset, batch_size=32, shuffle=False, collate_fn=pad_collate_fn)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu' 
     config = LlamaConfig(vocab_size=144448, dim=1024, n_layers=12, n_heads=16)  
