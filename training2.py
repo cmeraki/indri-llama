@@ -85,7 +85,7 @@ def main():
     print(f"Using device: {device}")
     
     config = LlamaConfig(
-        vocab_size=128000,  
+        vocab_size=max(max(seq) for seq in tokens) + 1,  
         dim=1024, 
         n_layers=12, 
         n_heads=16
