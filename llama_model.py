@@ -449,7 +449,7 @@ class Llama(nn.Module):
 
 
 def get_model(
-        model_type='llama-7b',
+        model_type='llama-1b',
         vocab_size=32000,
         dropout=0.0,
         max_seq_len=2048,
