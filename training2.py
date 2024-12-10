@@ -25,7 +25,7 @@ def pad_collate_fn(batch):
     batch = [torch.tensor(seq, dtype=torch.int32) for seq in batch]
     max_len = max(len(seq) for seq in batch)
     
-    padded_batch = torch.full((len(batch), max_len), fill_value=-100, dtype=torch.int32)    
+    padded_batch = torch.full((len(batch), max_len), fill_value=0, dtype=torch.int32)    
     for i, seq in enumerate(batch):
         padded_batch[i, :len(seq)] = seq
     
@@ -77,7 +77,7 @@ def main():
     val_dataset = TokenDataset(val_tokens)
     test_dataset = TokenDataset(test_tokens)
 
-    train_loader = data.DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=pad_collate_fn)
+    train_loader = data.DataLoader(train_dataset, batch_size=16, shuffle=True, collate_fn=pad_collate_fn)
     val_loader = data.DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=pad_collate_fn)
     test_loader = data.DataLoader(test_dataset, batch_size=32, shuffle=False, collate_fn=pad_collate_fn)
 
