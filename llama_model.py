@@ -181,15 +181,19 @@ class Attention(nn.Module):
         scores = torch.matmul(xq, keys.transpose(1, 2)) / math.sqrt(self.head_dim)
         
         if mask is not None:
+            # Ensure mask has the correct shape
             if mask.ndim == 2:
                 mask = mask.unsqueeze(1).unsqueeze(1)
             elif mask.ndim == 3:
                 mask = mask.unsqueeze(1)
             
+            # Repeat the mask to match the number of heads
             mask = mask.repeat(1, self.n_heads, 1, 1)
             
             if mask.shape[-1] < scores.shape[-1]:
                 mask = F.pad(mask, (0, scores.shape[-1] - mask.shape[-1]))
+            elif mask.shape[-1] > scores.shape[-1]:
+                mask = mask[..., :scores.shape[-1]]
             
             scores = scores + mask
         
