@@ -5,7 +5,7 @@ import torch.utils.data as data
 import pickle
 import os
 from sklearn.model_selection import train_test_split
-from llama_model import Llama, LlamaConfig
+from llama import Llama, LlamaConfig
 import wandb  # Optional: for experiment tracking
 import numpy as np
 from torch.optim.lr_scheduler import CosineAnnealingLR
