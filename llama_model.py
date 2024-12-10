@@ -179,9 +179,19 @@ class Attention(nn.Module):
         values = values.transpose(1, 2).reshape(bsz * self.n_heads, seqlen, self.head_dim)
         
         scores = torch.matmul(xq, keys.transpose(1, 2)) / math.sqrt(self.head_dim)
+        
         if mask is not None:
-            mask = mask.unsqueeze(1).repeat(1, self.n_heads, 1, 1)
-            scores = scores + mask[:, :, :seqlen, :seqlen]
+            if mask.ndim == 2:
+                mask = mask.unsqueeze(1).unsqueeze(1)
+            elif mask.ndim == 3:
+                mask = mask.unsqueeze(1)
+            
+            mask = mask.repeat(1, self.n_heads, 1, 1)
+            
+            if mask.shape[-1] < scores.shape[-1]:
+                mask = F.pad(mask, (0, scores.shape[-1] - mask.shape[-1]))
+            
+            scores = scores + mask
         
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)
@@ -286,12 +296,21 @@ class Llama(nn.Module):
             self.freqs_cis = self.precompute_freqs_cis(seqlen, h.size(-1)).to(h.device)
         
         freqs_cis = self.freqs_cis[:seqlen].to(h.device)        
-        mask = torch.full((seqlen, seqlen), float("-inf"), device=h.device)
-        mask = torch.triu(mask, diagonal=1)
-        mask = mask.type_as(h)
         
+        # Create causal mask
+        mask = torch.triu(torch.full((seqlen, seqlen), float('-inf'), device=h.device), diagonal=1)
+        
+        # If attention_mask is provided, combine it with the causal mask
         if attention_mask is not None:
-            mask = mask + attention_mask[:, None, None, :seqlen]
+            # Ensure attention_mask is broadcastable
+            if attention_mask.ndim == 2:
+                attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
+            
+            # Convert attention mask to the same type as the causal mask
+            attention_mask = attention_mask.to(mask.dtype)
+            
+            # Combine masks
+            mask = mask + attention_mask[:, :, :seqlen, :seqlen]
 
         start_pos = 0
         for layer in self.layers:
