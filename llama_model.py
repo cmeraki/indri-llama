@@ -1,44 +1,47 @@
-import os
-import glob
-import fire
-import time
-import json
-import math
-from pathlib import Path
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, TypedDict
 import torch
-from torch import nn
+import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+import math
+from typing import List, Optional, Tuple
+import inspect 
 
-from tokenizer import Tokenizer
-@dataclass
-class ModelArgs:
-    dim: int = 4096
-    n_layers: int = 32
-    n_heads: int = 32
-    n_kv_heads: Optional[int] = None
-    vocab_size: int = -1
-    multiple_of: int = 256 
-    ffn_dim_multiplier: Optional[float] = None
-    norm_eps: float = 1e-5
-    rope_theta: float = 500000
-    use_scaled_rope: bool = False
-    max_batch_size: int = 32
-    max_seq_len: int = 2048
+class LlamaConfig:
+    def __init__(self, 
+        dim: int = 4096,
+        n_layers: int = 32,
+        n_heads: int = 32,
+        vocab_size: int = -1,
+        multiple_of: int = 256,
+        ffn_dim_multiplier: Optional[float] = None,
+        norm_eps: float = 1e-5,
+        rope_theta: float = 500000,
+        use_scaled_rope: bool = False,
+        max_batch_size: int = 32,
+        max_seq_len: int = 2048,
+        n_kv_heads: Optional[int] = None,
+        dropout: float = 0.0
+    ):
+        self.dim = dim
+        self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.vocab_size = vocab_size
+        self.multiple_of = multiple_of
+        self.ffn_dim_multiplier = ffn_dim_multiplier
+        self.norm_eps = norm_eps
+        self.rope_theta = rope_theta
+        self.use_scaled_rope = use_scaled_rope
+        self.max_batch_size = max_batch_size
+        self.max_seq_len = max_seq_len
+        self.n_kv_heads = n_kv_heads if n_kv_heads is not None else n_heads
+        self.dropout = dropout
 
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            if hasattr(self, k):
-                setattr(self, k, v)
         if self.n_kv_heads is None:
             self.n_kv_heads = self.n_heads
         assert self.n_kv_heads <= self.n_heads
         assert self.n_heads % self.n_kv_heads == 0
         assert self.dim % self.n_heads == 0
 
-class RMSNorm(torch.nn.Module):
+class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
@@ -50,7 +53,6 @@ class RMSNorm(torch.nn.Module):
     def forward(self, x):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
-
 
 def apply_scaling(freqs: torch.Tensor):
     scale_factor = 8
@@ -75,7 +77,6 @@ def apply_scaling(freqs: torch.Tensor):
             new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
     return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
 
-
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device, dtype=torch.float32)
@@ -85,14 +86,12 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled:
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
 
-
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     ndim = x.ndim
     assert 0 <= 1 < ndim
     assert freqs_cis.shape == (x.shape[1], x.shape[-1])
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
-
 
 def apply_rotary_emb(
     xq: torch.Tensor,
@@ -106,7 +105,6 @@ def apply_rotary_emb(
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
-
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     bs, slen, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
@@ -117,23 +115,35 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
 
+def sample_top_p(probs, p):
+    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    mask = probs_sum - probs_sort > p
+    probs_sort[mask] = 0.0
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    next_token = torch.multinomial(probs_sort, num_samples=1)
+    next_token = torch.gather(probs_idx, -1, next_token)
+    return next_token
+
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
-        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        model_parallel_size = 1 
-        self.n_local_heads = args.n_heads // model_parallel_size
-        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads
-        self.head_dim = args.dim // args.n_heads
+        self.n_kv_heads = config.n_kv_heads
+        self.n_heads = config.n_heads
+        self.head_dim = config.dim // config.n_heads
+        self.n_rep = self.n_heads // self.n_kv_heads
 
-        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False )
-        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+        self.wq = nn.Linear(config.dim, config.n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(config.n_heads * self.head_dim, config.dim, bias=False)
 
-        self.cache_k = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim)).cuda()
-        self.cache_v = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim)).cuda()
+        self.cache_k = torch.zeros(
+            (config.max_batch_size, config.max_seq_len, self.n_kv_heads, self.head_dim)
+        ).cuda()
+        self.cache_v = torch.zeros(
+            (config.max_batch_size, config.max_seq_len, self.n_kv_heads, self.head_dim)
+        ).cuda()
 
     def forward(
         self,
@@ -144,9 +154,11 @@ class Attention(nn.Module):
     ):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        
+        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+        
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
         if start_pos >= 0:
@@ -157,20 +169,22 @@ class Attention(nn.Module):
             keys = self.cache_k[:bsz, : start_pos + seqlen]
             values = self.cache_v[:bsz, : start_pos + seqlen]
         else:
-            keys = xk
-            values = xv
+            keys, values = xk, xv
 
-        keys = repeat_kv(keys, self.n_rep)  
-        values = repeat_kv(values, self.n_rep)  
+        keys = repeat_kv(keys, self.n_rep)
+        values = repeat_kv(values, self.n_rep)
 
-        xq = xq.transpose(1, 2)  
-        keys = keys.transpose(1, 2)  
-        values = values.transpose(1, 2)  
+        xq = xq.transpose(1, 2)
+        keys = keys.transpose(1, 2)
+        values = values.transpose(1, 2)
+        
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
-            scores = scores + mask  
+            scores = scores + mask
+        
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  
+        output = torch.matmul(scores, values)
+        
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
@@ -187,6 +201,7 @@ class FeedForward(nn.Module):
         if ffn_dim_multiplier is not None:
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+        
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
@@ -195,21 +210,23 @@ class FeedForward(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 class TransformerBlock(nn.Module):
-    def __init__(self, layer_id: int, args: ModelArgs):
+    def __init__(self, config: LlamaConfig, layer_id: int):
         super().__init__()
-        self.n_heads = args.n_heads
-        self.dim = args.dim
-        self.head_dim = args.dim // args.n_heads
-        self.attention = Attention(args)
+        self.n_heads = config.n_heads
+        self.dim = config.dim
+        self.head_dim = config.dim // config.n_heads
+        
+        self.attention = Attention(config)
         self.feed_forward = FeedForward(
-            dim=args.dim,
-            hidden_dim=4 * args.dim,
-            multiple_of=args.multiple_of,
-            ffn_dim_multiplier=args.ffn_dim_multiplier,
+            dim=config.dim,
+            hidden_dim=4 * config.dim,
+            multiple_of=config.multiple_of,
+            ffn_dim_multiplier=config.ffn_dim_multiplier,
         )
+        
         self.layer_id = layer_id
-        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
-        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps)
+        self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps)
 
     def forward(
         self,
@@ -222,27 +239,38 @@ class TransformerBlock(nn.Module):
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
-class Transformer(nn.Module):
-    def __init__(self, params: ModelArgs):
+class Llama(nn.Module):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
-        self.params = params
-        self.vocab_size = params.vocab_size
-        self.n_layers = params.n_layers
+        self.config = config
+        self.vocab_size = config.vocab_size
+        self.n_layers = config.n_layers
 
-        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
+        self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
         self.layers = torch.nn.ModuleList()
-        for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(layer_id, params))
+        
+        for layer_id in range(config.n_layers):
+            self.layers.append(TransformerBlock(config, layer_id))
 
-        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
+        self.norm = RMSNorm(config.dim, eps=config.norm_eps)
+        self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
         self.freqs_cis = precompute_freqs_cis(
-            params.dim // params.n_heads,
-            params.max_seq_len * 2,
-            params.rope_theta,
-            params.use_scaled_rope,
+            config.dim // config.n_heads,
+            config.max_seq_len * 2,
+            config.rope_theta,
+            config.use_scaled_rope,
         )
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward_inference(self, tokens: torch.Tensor, start_pos: int):
         _bsz, seqlen = tokens.shape
@@ -278,267 +306,223 @@ class Transformer(nn.Module):
         h = self.norm(h)
         logits = self.output(h).float()
         loss = F.cross_entropy(
-            input=logits.transpose(1, 2),
-            target=targets,
-            reduction="mean",
-            ignore_index=ignore_index,
-        )
+            input=logits.transpose(1, 2), target=targets, ignore_index=ignore_index)
         return loss
 
-    def configure_optimizers(self, learning_rate, weight_decay=0.0, betas=(0.9, 0.97), device_type='cuda'):
-        train_params = []
-        for name, param in self.named_parameters():
-            if "norm" in name:
-                train_params.append(param)
-        fused_available = True 
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        
+        # create optim groups. Separate weight decay for 2D params
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        
+        # Print parameter information
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(train_params, lr=learning_rate, betas=betas, **extra_args)
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
+
         return optimizer
 
-class CompletionPrediction(TypedDict, total=False):
-    generation: str
-    tokens: List[str]  
-    logprobs: List[float]
-class Llama:
+    @classmethod
+    def from_pretrained(cls, model_type, weights=None):
+        """
+        Load pretrained Llama model weights
+        Note: Implementation will depend on specific pretrained checkpoints
+        """
+        from transformers import LlamaForCausalLM
 
-    @staticmethod
-    def build(
-        ckpt_dir: str,
-        tokenizer_path: str,
-        max_seq_len: int,
-        max_batch_size: int,
-        model_parallel_size: Optional[int] = 1, # AK: changed None -> 1
-        seed: int = 1,
-    ) -> "Llama":
-        assert 1 <= max_seq_len <= 8192, f"max_seq_len must be between 1 and 8192, got {max_seq_len}."
-        assert os.path.isdir(ckpt_dir), f"Checkpoint directory '{ckpt_dir}' does not exist."
-        assert os.path.isfile(tokenizer_path), f"Tokenizer file '{tokenizer_path}' does not exist."
+        # Define model configurations (example, adjust as needed)
+        config_args = {
+            'llama-7b': dict(n_layers=32, dim=4096, n_heads=32),
+            'llama-13b': dict(n_layers=40, dim=5120, n_heads=40),
+            'llama-33b': dict(n_layers=60, dim=6656, n_heads=52),
+            'llama-1b': dict(n_layers=12, dim=1024, n_heads=16),
+            # Add more model types as needed
+        }
 
-        local_rank = 0
-        torch.cuda.set_device(local_rank)
-        torch.manual_seed(seed) # seed must be the same in all processes
+        assert model_type in config_args, f"Unsupported model type: {model_type}"
 
-        start_time = time.time()
-        checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
-        assert len(checkpoints) > 0, f"no checkpoint files found in {ckpt_dir}"
-        assert model_parallel_size == len(checkpoints)
-        ckpt_path = checkpoints[0]
-        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        with open(Path(ckpt_dir) / "params.json", "r") as f:
-            params = json.loads(f.read())
+        # Create configuration
+        config_args[model_type]['vocab_size'] = 32000  # Typical Llama vocab size
+        config_args[model_type]['max_seq_len'] = 2048  # Typical sequence length
+        config = LlamaConfig(**config_args[model_type])
 
-        model_args: ModelArgs = ModelArgs(
-            max_seq_len=max_seq_len,
-            max_batch_size=max_batch_size,
-            **params,
-        )
-        tokenizer = Tokenizer(model_path=tokenizer_path)
-        assert model_args.vocab_size == tokenizer.n_words
-        if torch.cuda.is_bf16_supported():
-            torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)
-        else:
-            torch.set_default_tensor_type(torch.cuda.HalfTensor)
-        model = Transformer(model_args)
-        model.load_state_dict(checkpoint, strict=False)
-        print(f"Loaded in {time.time() - start_time:.2f} seconds")
-        return Llama(model, tokenizer)
+        # Create model
+        model = cls(config)
 
-    def __init__(self, model: Transformer, tokenizer: Tokenizer):
-        self.model = model
-        self.tokenizer = tokenizer
+        # Load HuggingFace model
+        model_hf = LlamaForCausalLM.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+        sd = model.state_dict()
+
+        # Mapping and copying weights (simplified, may need adjustments)
+        for k, v in sd_hf.items():
+            if k in sd:
+                sd[k].copy_(v)
+
+        return model
 
     @torch.inference_mode()
-    def generate(
-        self,
-        prompt_tokens: List[List[int]],
-        max_gen_len: int,
-        temperature: float = 0.6,
-        top_p: float = 0.9,
-        logprobs: bool = False,
-        echo: bool = False,
-    ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:
-        params = self.model.params
-        bsz = len(prompt_tokens)
-        assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, stop_token=None):
+        """
+        Generate sequence with similar logic to GPT generation method
+        Adapted for Llama's specific forward methods
+        """
+        start_pos = 0
+        for _ in range(max_new_tokens):
+            idx_cond = idx if idx.size(1) <= self.config.max_seq_len else idx[:, -self.config.max_seq_len:]           
+            logits = self.forward_inference(idx_cond, start_pos)            
+            logits = logits[:, -1, :] / temperature
+            
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            
+            probs = F.softmax(logits, dim=-1)
+            
+            idx_next = torch.multinomial(probs, num_samples=1)
 
-        min_prompt_len = min(len(t) for t in prompt_tokens)
-        max_prompt_len = max(len(t) for t in prompt_tokens)
-        assert max_prompt_len <= params.max_seq_len
-        total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
-
-        pad_id = self.tokenizer.pad_id
-        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
-        for k, t in enumerate(prompt_tokens):
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
-        if logprobs:
-            token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
-
-        prev_pos = 0
-        eos_reached = torch.tensor([False] * bsz, device="cuda")
-        input_text_mask = tokens != pad_id
-
-        if min_prompt_len == total_len:
-            logits = self.model.forward_inference(tokens, prev_pos)
-            token_logprobs = -F.cross_entropy(
-                input=logits.transpose(1, 2),
-                target=tokens,
-                reduction="none",
-                ignore_index=pad_id,
-            )
-
-        stop_tokens = torch.tensor(list(self.tokenizer.stop_tokens))
-
-        for cur_pos in range(min_prompt_len, total_len):
-            logits = self.model.forward_inference(tokens[:, prev_pos:cur_pos], prev_pos)
-            if temperature > 0:
-                probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
-                next_token = sample_top_p(probs, top_p)
-            else:
-                next_token = torch.argmax(logits[:, -1], dim=-1)
-
-            next_token = next_token.reshape(-1)
-            next_token = torch.where(
-                input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
-            )
-            tokens[:, cur_pos] = next_token
-            if logprobs:
-                token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
-                    input=logits.transpose(1, 2),
-                    target=tokens[:, prev_pos + 1 : cur_pos + 1],
-                    reduction="none",
-                    ignore_index=pad_id,
-                )
-            eos_reached |= (~input_text_mask[:, cur_pos]) & (
-                torch.isin(next_token, stop_tokens)
-            )
-            prev_pos = cur_pos
-            if all(eos_reached):
+            if stop_token is not None and idx_next == stop_token:
                 break
 
-        if logprobs:
-            token_logprobs = token_logprobs.tolist()
-        out_tokens, out_logprobs = [], []
-        for i, toks in enumerate(tokens.tolist()):
-            start = 0 if echo else len(prompt_tokens[i])
-            toks = toks[start : len(prompt_tokens[i]) + max_gen_len]
-            probs = None
-            if logprobs:
-                probs = token_logprobs[i][start : len(prompt_tokens[i]) + max_gen_len]
-            for stop_token in self.tokenizer.stop_tokens:
-                try:
-                    eos_idx = toks.index(stop_token)
-                    toks = toks[:eos_idx]
-                    probs = probs[:eos_idx] if logprobs else None
-                except ValueError:
-                    pass
-            out_tokens.append(toks)
-            out_logprobs.append(probs)
-        return (out_tokens, out_logprobs if logprobs else None)
+            idx = torch.cat((idx, idx_next), dim=1)
+            start_pos += 1
 
-    def text_completion(
-        self,
-        prompts: List[str],
-        temperature: float = 0.6,
-        top_p: float = 0.9,
-        max_gen_len: Optional[int] = None,
-        logprobs: bool = False,
-        echo: bool = False,
-    ) -> List[CompletionPrediction]:
-        if max_gen_len is None:
-            max_gen_len = self.model.params.max_seq_len - 1
-        prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
-        generation_tokens, generation_logprobs = self.generate(
-            prompt_tokens=prompt_tokens,
-            max_gen_len=max_gen_len,
-            temperature=temperature,
-            top_p=top_p,
-            logprobs=logprobs,
-            echo=echo,
+        return idx
+
+    def expand_vocab(self, new_vocab_size):
+        print(f"Updating embeddings {self.vocab_size, self.config.dim} => {new_vocab_size, self.config.dim}")
+        
+        old_embeddings = self.tok_embeddings.weight
+        new_embeddings = torch.Tensor(new_vocab_size, self.config.dim).to(old_embeddings.device)
+
+        mu = torch.mean(old_embeddings, dim=0)
+        sigma = ((old_embeddings - mu).T @ (old_embeddings - mu)) / self.vocab_size
+        dist = torch.distributions.multivariate_normal.MultivariateNormal(
+            mu, covariance_matrix=1e-5 * sigma)
+
+        new_embeddings[:self.vocab_size] = self.tok_embeddings.weight
+        new_embeddings[self.vocab_size:] = torch.stack(
+            tuple((dist.sample() for _ in range(new_vocab_size - self.vocab_size))), 
+            dim=0
         )
-        if logprobs:
-            return [
-                {
-                    "generation": self.tokenizer.decode(t),
-                    "tokens": [self.tokenizer.decode([x]) for x in t],
-                    "logprobs": logprobs_i,
-                }
-                for t, logprobs_i in zip(generation_tokens, generation_logprobs)
-            ]
-        return [{"generation": self.tokenizer.decode(t)} for t in generation_tokens]
 
-def sample_top_p(probs, p):
-    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    mask = probs_sum - probs_sort > p
-    probs_sort[mask] = 0.0
-    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-    next_token = torch.multinomial(probs_sort, num_samples=1)
-    next_token = torch.gather(probs_idx, -1, next_token)
-    return next_token
+        self.tok_embeddings = nn.Embedding(_weight=new_embeddings, 
+                                           num_embeddings=new_vocab_size, 
+                                           embedding_dim=self.config.dim)
+        self.output = nn.Linear(self.config.dim, new_vocab_size, bias=False)
+        self.output.weight = self.tok_embeddings.weight
 
-def _peek_data_shard(filename):
-    # only reads the header, returns header data
-    with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256*4), dtype=np.int32)
-    if header[0] != 20240801:
-        print("ERROR: magic number mismatch in the data .bin file!")
-        exit(1)
-    assert header[1] == 7, "unsupported version"
-    ntok = header[2] # number of tokens (claimed)
-    return ntok # for now just return the number of tokens
+        self.config.vocab_size = new_vocab_size
+        self.vocab_size = new_vocab_size
 
-def _load_data_shard(filename):
-    with open(filename, "rb") as f:
-        header = np.frombuffer(f.read(256*4), dtype=np.int32)
-        assert header[0] == 20240801, "magic number mismatch in the data .bin file"
-        assert header[1] == 7, "unsupported version"
-        ntok = header[2] 
-        tokens = np.frombuffer(f.read(), dtype=np.uint32)
-    assert len(tokens) == ntok, "number of tokens read does not match header?"
-    return tokens
 
-class DistributedDataLoader:
-    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
-        self.process_rank = process_rank
-        self.num_processes = num_processes
-        self.B = B
-        self.T = T
+def get_model(
+        model_type='llama-7b',
+        vocab_size=32000,
+        dropout=0.0,
+        max_seq_len=2048,
+        bias=False,
+        device='cpu',
+        compile=True,
+        path=None
+    ):
 
-        self.files = sorted(glob.glob(filename_pattern))
-        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
+    config_args = {
+        'llama-7b': dict(
+            n_layers=32, 
+            dim=4096, 
+            n_heads=32, 
+            rope_theta=10000.0, 
+            norm_eps=1e-5,
+            use_scaled_rope=True
+        ),
+        'llama-13b': dict(
+            n_layers=40, 
+            dim=5120, 
+            n_heads=40, 
+            rope_theta=10000.0, 
+            norm_eps=1e-5,
+            use_scaled_rope=True
+        ),
+        'llama-33b': dict(
+            n_layers=60, 
+            dim=6656, 
+            n_heads=52, 
+            rope_theta=10000.0, 
+            norm_eps=1e-5,
+            use_scaled_rope=True
+        ),
+        'llama-1b': dict(
+            n_layers=12,
+            dim=1024,  
+            n_heads=16,   
+            rope_theta=10000.0,
+            norm_eps=1e-5,
+            use_scaled_rope=True
+        )
+    }[model_type]
 
-        ntok_total = 0
-        for fname in self.files:
-            shard_ntok = _peek_data_shard(fname)
-            assert shard_ntok >= num_processes * B * T + 1
-            ntok_total += shard_ntok
-        self.ntok_total = ntok_total
-        print(f"DataLoader: total number of tokens: {ntok_total:,} across {len(self.files)} files")
+    model_args = dict(
+        max_seq_len=max_seq_len,
+        vocab_size=vocab_size,
+        rope_theta=config_args.get('rope_theta', 10000.0),
+        norm_eps=config_args.get('norm_eps', 1e-5),
+        use_scaled_rope=config_args.get('use_scaled_rope', True)
+    )
+    model_args.update(config_args)
 
-        self.current_shard = None
-        self.reset()
+    if path:
+        checkpoint = torch.load(path, map_location=device)
+        
+        if 'config' in checkpoint:
+            config = checkpoint['config']
+            if isinstance(config, dict):
+                model_args.update(config)
+                llamaconf = LlamaConfig(**model_args)
+            else:
+                llamaconf = config
+        else:
+            llamaconf = LlamaConfig(**model_args)
+    else:
+        llamaconf = LlamaConfig(**model_args)
 
-    def reset(self):
-        if self.current_shard != 0:
-            self.current_shard = 0
-            self.tokens = _load_data_shard(self.files[self.current_shard])
-        self.current_position = self.process_rank * self.B * self.T
+    print("MODEL CONFIG: ", llamaconf)
 
-    def advance(self): # advance to next data shard
-        self.current_shard = (self.current_shard + 1) % len(self.files)
-        self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
+    model = Llama(llamaconf)
 
-    def next_batch(self):
-        B = self.B
-        T = self.T
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
-        buf = torch.tensor(buf, dtype=torch.long)
-        x = (buf[:-1]).view(B, T) 
-        y = (buf[1:]).view(B, T) 
-        self.current_position += B * T * self.num_processes
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.advance()
-        return x, y
+    # Load weights if path is provided
+    if path:
+        state_dict = checkpoint['model']
+        
+        # Remove any unwanted prefixes (common in distributed training)
+        unwanted_prefix = '_orig_mod.'
+        for k, v in list(state_dict.items()):
+            if k.startswith(unwanted_prefix):
+                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+        
+        model.load_state_dict(state_dict)
+    
+    model.to(device)
+
+    if compile:
+        print("compiling the model... (takes a ~minute)")
+        torch.compile(model)
+
+    return model
