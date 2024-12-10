@@ -29,7 +29,7 @@ class TokenDataset(data.Dataset):
         return len(self.tokens)
 
     def __getitem__(self, idx):
-        seq = torch.tensor(self.tokens[idx], dtype=torch.int32)
+        seq = torch.tensor(self.tokens[idx].clone().detach(), dtype=torch.int32)
         
         task_token_idx = torch.where(seq == 144642)[0]
         speaker_token_idx = torch.where(seq == 144645)[0]
@@ -74,7 +74,7 @@ def pad_collate_fn(batch, max_input_len=2048, max_target_len=2048):
 def train_model(model, train_loader, val_loader, optimizer, criterion, device, num_epochs=10, scheduler=None):
     best_val_loss = float('inf')
     accumulation_steps = 4  
-    scaler = torch.cuda.amp.GradScaler(device)
+    scaler = torch.amp.GradScaler(device)
 
     for epoch in range(num_epochs):
         model.train()
@@ -87,7 +87,7 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, device, n
             input_masks = input_masks.to(device)
             target_masks = target_masks.to(device)
 
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(device):
                 outputs = model(inputs, attention_mask=input_masks)
                 
                 loss = criterion(
@@ -109,7 +109,6 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, device, n
 
             total_train_loss += loss.item() * accumulation_steps
 
-
         model.eval()
         total_val_loss = 0
         with torch.no_grad():
@@ -119,7 +118,7 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, device, n
                 input_masks = input_masks.to(device)
                 target_masks = target_masks.to(device)
 
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast(device):
                     outputs = model(inputs, attention_mask=input_masks)
                     val_loss = criterion(
                         outputs.view(-1, outputs.size(-1))[target_masks.view(-1)], 
@@ -127,7 +126,6 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, device, n
                     )
                 
                 total_val_loss += val_loss.item()
-
 
         avg_train_loss = total_train_loss / len(train_loader)
         avg_val_loss = total_val_loss / len(val_loader)
@@ -171,7 +169,7 @@ def main():
         collate_fn=lambda batch: pad_collate_fn(batch, max_input_len=512, max_target_len=512),
         num_workers=4,  
         pin_memory=True  
-)
+    )
     val_loader = data.DataLoader(
         val_dataset, 
         batch_size=32, 
