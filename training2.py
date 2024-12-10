@@ -23,14 +23,18 @@ class TokenDataset(data.Dataset):
 
 def train_model(model, train_loader, optimizer, criterion, device, num_epochs=10):
     model.train()
+    scaler = torch.cuda.amp.GradScaler()  
     for epoch in range(num_epochs):
         total_loss = 0
         for batch in train_loader:
             batch = batch.to(device)
             optimizer.zero_grad()
-            outputs = model.forward_loss(batch[:, :-1], batch[:, 1:]) 
-            loss = criterion(outputs, batch[:, 1:])  
-            optimizer.step()
+            with torch.cuda.amp.autocast():  
+                outputs = model.forward_loss(batch[:, :-1], batch[:, 1:])
+                loss = criterion(outputs, batch[:, 1:])
+            scaler.scale(loss).backward()  
+            scaler.step(optimizer)  
+            scaler.update()  
             total_loss += loss.item()
 
         avg_loss = total_loss / len(train_loader)
@@ -55,7 +59,7 @@ def main():
     optimizer = optim.AdamW(model.parameters(), lr=1e-4)
     criterion = nn.CrossEntropyLoss(ignore_index=-100) 
 
-    train_model(model, train_loader, optimizer, criterion, device='cuda' if torch.cuda.is_available() else 'cpu', num_epochs=10)
+    train_model(model, train_loader, optimizer, criterion, device, num_epochs=10)
 
     torch.save(model.state_dict(), 'llama_model.pth')
 
