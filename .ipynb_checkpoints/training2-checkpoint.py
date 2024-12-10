@@ -31,35 +31,45 @@ def pad_collate_fn(batch):
     
     return padded_batch
 
-def train_model(model, train_loader, optimizer, criterion, device, num_epochs=10):
-    model.train()
-    scaler = torch.amp.GradScaler(device)
-    
+def train_model(model, train_loader, val_loader, optimizer, device, num_epochs=10):
+    accumulation_steps = 16
+
+    scaler = torch.GradScaler(device)
+
     for epoch in range(num_epochs):
+        model.train()
         total_loss = 0
-        for batch in train_loader:
-            batch = batch.to(device, dtype=torch.long)            
-            print(f"Batch shape: {batch.shape}, Device: {batch.device}, Dtype: {batch.dtype}")
-            
-            optimizer.zero_grad()
-            
-            try:
-                with torch.cuda.amp.autocast():
-                    outputs = model.forward_loss(batch[:, :-1], batch[:, 1:])
-                    loss = criterion(outputs.view(-1, outputs.size(-1)), batch[:, 1:].view(-1))
-                
-                scaler.scale(loss).backward()
+        optimizer.zero_grad()
+
+        for batch_idx, (inputs, targets) in enumerate(train_loader):
+            inputs, targets = inputs.to(device), targets.to(device)
+
+            with torch.autocast(device):
+                loss = model.forward_loss(inputs, targets) / accumulation_steps  
+
+            scaler.scale(loss).backward(retain_graph=True)
+
+            if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
                 scaler.step(optimizer)
                 scaler.update()
-                
-                total_loss += loss.item()
-                
-            except Exception as e:
-                print(f"Error in training: {e}")
-                raise
 
-        avg_loss = total_loss / len(train_loader)
-        print(f'Epoch [{epoch + 1}/{num_epochs}], Loss: {avg_loss:.4f}')
+                optimizer.zero_grad()
+
+            total_loss += loss.item() * accumulation_steps  
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for inputs, targets in val_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                with torch.autocast(device):
+                    val_loss += model.forward_loss(inputs, targets).item()
+
+        print(f'Epoch [{epoch + 1}/{num_epochs}], '
+              f'Train Loss: {total_loss / len(train_loader):.4f}, '
+              f'Val Loss: {val_loss / len(val_loader):.4f}')
 
 def main():
     torch.backends.cudnn.enabled = False
@@ -77,7 +87,7 @@ def main():
     val_dataset = TokenDataset(val_tokens)
     test_dataset = TokenDataset(test_tokens)
 
-    train_loader = data.DataLoader(train_dataset, batch_size=16, shuffle=True, collate_fn=pad_collate_fn)
+    train_loader = data.DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=pad_collate_fn)
     val_loader = data.DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=pad_collate_fn)
     test_loader = data.DataLoader(test_dataset, batch_size=32, shuffle=False, collate_fn=pad_collate_fn)
 
@@ -93,7 +103,7 @@ def main():
     
     model = Llama(config).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=1e-4)
-    criterion = nn.CrossEntropyLoss(ignore_index=-100)
+    criterion = nn.CrossEntropyLoss(ignore_index=0)
 
     train_model(model, train_loader, optimizer, criterion, device, num_epochs=10)
 
