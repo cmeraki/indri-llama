@@ -1,235 +1,206 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.utils.data as data
-import pickle
 import os
-from sklearn.model_selection import train_test_split
-from llama_model import Llama, LlamaConfig
+import time
+import math
+import json
+import torch
+import random
 import numpy as np
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from pathlib import Path
+import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
+from torch.utils.data import Dataset, DataLoader
 
-def seed_everything(seed=42):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-def load_data(file_path):
-    with open(file_path, 'rb') as f:
-        data = pickle.load(f)
-    return data
-
-class TokenDataset(data.Dataset):
-    def __init__(self, tokens):
-        self.tokens = tokens
+class TokenDataset(Dataset):
+    def __init__(self, tokens_file, block_size=2048):
+        self.tokens = torch.load(tokens_file)
+        self.block_size = block_size
+        
+        self.TEXT_START_TOKEN = 128000  # Adjust as needed
+        self.TASK_TOKEN = 144642
+        self.SPEAKER_TOKEN = 144645
+        self.AUDIO_START_TOKEN = 144641
+        self.STOP_TOKEN = 144644
 
     def __len__(self):
         return len(self.tokens)
 
     def __getitem__(self, idx):
-        seq = torch.tensor(self.tokens[idx], dtype=torch.int32)
+        # Get the full token sequence
+        full_sequence = self.tokens[idx]
         
-        task_token_idx = torch.where(seq == 144642)[0]
-        speaker_token_idx = torch.where(seq == 144645)[0]
-        audio_start_token_idx = torch.where(seq == 144641)[0]
-        stop_token_idx = torch.where(seq == 144644)[0]
+        # Find the positions of key tokens
+        audio_start_idx = torch.where(full_sequence == self.AUDIO_START_TOKEN)[0]
         
-        if (len(task_token_idx) == 0 or len(speaker_token_idx) == 0 or 
-            len(audio_start_token_idx) == 0 or len(stop_token_idx) == 0):
-            raise ValueError("Required special tokens not found in sequence")
+        if len(audio_start_idx) == 0:
+            raise ValueError("Audio start token not found in the sequence")
         
-        task_token_idx = task_token_idx[0].item()
-        speaker_token_idx = speaker_token_idx[0].item()
-        audio_start_token_idx = audio_start_token_idx[0].item()
-        stop_token_idx = stop_token_idx[0].item()
+        audio_start_idx = audio_start_idx[0]
         
-        inputs = seq[:audio_start_token_idx + 1]        
-        targets = seq[audio_start_token_idx + 1:stop_token_idx + 1]
+        # Prepare input and target sequences
+        if full_sequence.size(0) > self.block_size:
+            full_sequence = full_sequence[:self.block_size]
         
-        return inputs, targets
+        # The entire sequence is used for both input and target
+        x = full_sequence.clone()
+        y = full_sequence.clone()
+        
+        # Additional metadata for potential use
+        metadata = {
+            'text_tokens': full_sequence[:audio_start_idx].tolist(),
+            'audio_tokens': full_sequence[audio_start_idx+1:].tolist(),
+            'task_token_pos': torch.where(full_sequence == self.TASK_TOKEN)[0][0] if self.TASK_TOKEN in full_sequence else -1,
+            'speaker_token_pos': torch.where(full_sequence == self.SPEAKER_TOKEN)[0][0] if self.SPEAKER_TOKEN in full_sequence else -1
+        }
+        
+        return x, y, metadata
 
-def pad_collate_fn(batch):
-    inputs, targets = zip(*batch)
-
-    max_input_len = max(len(seq) for seq in inputs)
-    padded_inputs = torch.full((len(inputs), max_input_len), fill_value=0, dtype=torch.int32)
-    input_masks = torch.zeros((len(inputs), max_input_len), dtype=torch.bool)
+def get_lr(it, warmup_iters=2000, lr_decay_iters=300000, min_lr=1e-6, learning_rate=6e-4):
+    if it < warmup_iters:
+        return learning_rate * it / warmup_iters
+    if it > lr_decay_iters:
+        return min_lr
     
-    for i, seq in enumerate(inputs):
-        padded_inputs[i, :len(seq)] = seq
-        input_masks[i, :len(seq)] = 1
+    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (learning_rate - min_lr)
 
-    max_target_len = max(len(seq) for seq in targets)
-    padded_targets = torch.full((len(targets), max_target_len), fill_value=0, dtype=torch.int32)
-    target_masks = torch.zeros((len(targets), max_target_len), dtype=torch.bool)
-    
-    for i, seq in enumerate(targets):
-        padded_targets[i, :len(seq)] = seq
-        target_masks[i, :len(seq)] = 1
+class MultimodalTrainer:
+    def __init__(self, 
+                 model, 
+                 tokens_file, 
+                 out_dir='./out', 
+                 batch_size=4, 
+                 block_size=2048, 
+                 learning_rate=6e-4,
+                 grad_accum_steps=64,
+                 steps=100000):
+        
+        self.ddp = int(os.environ.get('RANK', -1)) != -1
+        
+        if self.ddp:
+            init_process_group(backend='nccl')
+            self.ddp_rank = int(os.environ['RANK'])
+            self.ddp_local_rank = int(os.environ['LOCAL_RANK'])
+            self.ddp_world_size = int(os.environ['WORLD_SIZE'])
+            self.device = f'cuda:{self.ddp_local_rank}'
+            torch.cuda.set_device(self.device)
+            self.master_process = self.ddp_rank == 0
+        else:
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.master_process = True
+            self.ddp_world_size = 1
+        
+        self.model = model.to(self.device)
+        self.dataset = TokenDataset(tokens_file, block_size=block_size)
+        
+        if self.ddp:
+            self.model = DDP(self.model, device_ids=[self.ddp_local_rank])
+        
+        self.batch_size = batch_size
+        self.block_size = block_size
+        self.steps = steps
+        self.out_dir = out_dir
+        self.learning_rate = learning_rate
+        self.grad_accum_steps = grad_accum_steps
+        
+        self.dataloader = DataLoader(
+            self.dataset, 
+            batch_size=self.batch_size, 
+            shuffle=True, 
+            num_workers=4, 
+            pin_memory=True
+        )
+        
+        self.optimizer = self.model.module.configure_optimizers(
+            weight_decay=0.1, 
+            learning_rate=learning_rate, 
+            betas=(0.9, 0.95), 
+            device=self.device
+        )
+        self.scaler = torch.cuda.amp.GradScaler(enabled=True)
+        
+        os.makedirs(out_dir, exist_ok=True)
 
-    return padded_inputs, padded_targets, input_masks, target_masks
-
-def train_model(model, train_loader, val_loader, optimizer, criterion, device, num_epochs=10, scheduler=None):
-    best_val_loss = float('inf')
-    accumulation_steps = 64
-    scaler = torch.cuda.amp.GradScaler(device)
-
-    for epoch in range(num_epochs):
-        model.train()
-        total_train_loss = 0
-        optimizer.zero_grad()
-
-        for batch_idx, (inputs, targets, input_masks, target_masks) in enumerate(train_loader):
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-            input_masks = input_masks.to(device)
-            target_masks = target_masks.to(device)
-
-            with torch.cuda.amp.autocast():
-                outputs = model(inputs, attention_mask=input_masks)
+    def train(self):
+        iter_num = 0
+        best_val_loss = float('inf')
+        
+        while iter_num < self.steps:
+            for batch_x, batch_y, batch_metadata in self.dataloader:
+                lr = get_lr(iter_num)
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = lr
                 
-                loss = criterion(
-                    outputs.view(-1, outputs.size(-1))[target_masks.view(-1)], 
-                    targets.view(-1)[target_masks.view(-1)]
-                ) / accumulation_steps
-
-            scaler.scale(loss).backward()
-
-            if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-
-                if scheduler:
-                    scheduler.step()
-
-            total_train_loss += loss.item() * accumulation_steps
-
-
-        model.eval()
-        total_val_loss = 0
-        with torch.no_grad():
-            for inputs, targets, input_masks, target_masks in val_loader:
-                inputs = inputs.to(device)
-                targets = targets.to(device)
-                input_masks = input_masks.to(device)
-                target_masks = target_masks.to(device)
-
-                with torch.cuda.amp.autocast():
-                    outputs = model(inputs, attention_mask=input_masks)
-                    val_loss = criterion(
-                        outputs.view(-1, outputs.size(-1))[target_masks.view(-1)], 
-                        targets.view(-1)[target_masks.view(-1)]
-                    )
+                batch_x = batch_x.to(self.device)
+                batch_y = batch_y.to(self.device)
                 
-                total_val_loss += val_loss.item()
-
-
-        avg_train_loss = total_train_loss / len(train_loader)
-        avg_val_loss = total_val_loss / len(val_loader)
-
-        print(f'Epoch [{epoch + 1}/{num_epochs}], '
-              f'Train Loss: {avg_train_loss:.4f}, '
-              f'Val Loss: {avg_val_loss:.4f}')
-
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    logits, loss = self.model(batch_x, batch_y)
+                
+                loss = loss / self.grad_accum_steps
+                
+                self.scaler.scale(loss).backward()
+                
+                if (iter_num + 1) % self.grad_accum_steps == 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad(set_to_none=True)
+                
+                if self.master_process and iter_num % 1000 == 0:
+                    print(f"Step {iter_num}, Loss: {loss.item()}")
+                    
+                    checkpoint = {
+                        'model': self.model.module.state_dict() if self.ddp else self.model.state_dict(),
+                        'optimizer': self.optimizer.state_dict(),
+                        'iter': iter_num,
+                        'loss': loss.item()
+                    }
+                    torch.save(checkpoint, f"{self.out_dir}/checkpoint_{iter_num}.pt")
+                
+                iter_num += 1
+                
+                if iter_num >= self.steps:
+                    break
+        
+        if self.master_process:
+            final_model_path = f"{self.out_dir}/final_model.pt"
             torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': best_val_loss
-            }, 'best_model_checkpoint.pth')
-
-    return model
+                'model': self.model.module.state_dict() if self.ddp else self.model.state_dict(),
+                'config': self.model.module.config if self.ddp else self.model.config
+            }, final_model_path)
+            print(f"Training completed. Final model saved to {final_model_path}")
+        
+        if self.ddp:
+            destroy_process_group()
 
 def main():
-    seed_everything(42)
-    torch.backends.cudnn.enabled = False
-    
-    tokens = load_data('tokens/lj_speech_tokens.pkl')
-    
-    print(f"Total tokens: {len(tokens)}")
-    print(f"Sample token shape: {len(tokens[0])}")
-    print(f"Token value range: {min(min(seq) for seq in tokens)}-{max(max(seq) for seq in tokens)}")
-    
-    train_tokens, test_tokens = train_test_split(tokens, test_size=0.2, random_state=42)
-    val_tokens, test_tokens = train_test_split(test_tokens, test_size=0.5, random_state=42)
+    from llama_model import get_model 
 
-    train_dataset = TokenDataset(train_tokens)
-    val_dataset = TokenDataset(val_tokens)
-    test_dataset = TokenDataset(test_tokens)
+    tokens_file = 'tokens/lj_speech_tokens.pkl'  
+    vocab_size = 144645  
+    
+    model = get_model(
+        model_type='llama',
+        vocab_size=vocab_size,
+        dropout=0.1,
+        max_seq_len=2048,
+        bias=False,
+        device='cuda'
+    )
 
-    train_loader = data.DataLoader(
-        train_dataset, 
+    trainer = MultimodalTrainer(
+        model=model, 
+        tokens_file=tokens_file, 
         batch_size=4, 
-        shuffle=True, 
-        collate_fn=pad_collate_fn,
-        num_workers=4,  
-        pin_memory=True  
-    )
-    val_loader = data.DataLoader(
-        val_dataset, 
-        batch_size=4, 
-        shuffle=False, 
-        collate_fn=pad_collate_fn,
-        num_workers=4,
-        pin_memory=True
-    )
-    test_loader = data.DataLoader(
-        test_dataset, 
-        batch_size=4, 
-        shuffle=False, 
-        collate_fn=pad_collate_fn,
-        num_workers=4,
-        pin_memory=True
-    )
-
-    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    config = LlamaConfig(
-        vocab_size=max(max(seq) for seq in tokens) + 1,  
-        dim=1024, 
-        n_layers=12, 
-        n_heads=16
+        block_size=2048, 
+        steps=100000
     )
     
-    model = Llama(config).to(device)
-    
-    optimizer = optim.AdamW(
-        model.parameters(), 
-        lr=1e-4, 
-        weight_decay=0.01  
-    )
-    
-    scheduler = CosineAnnealingLR(
-        optimizer, 
-        T_max=len(train_loader) * 10,  
-        eta_min=1e-6 
-    )
-    
-    criterion = nn.CrossEntropyLoss(
-        label_smoothing=0.1,  
-        ignore_index=0  
-    )
-
-    trained_model = train_model(
-        model, 
-        train_loader, 
-        val_loader, 
-        optimizer, 
-        criterion, 
-        device, 
-        num_epochs=10,
-        scheduler=scheduler
-    )
-
-    torch.save(trained_model.state_dict(), 'final_llama_model.pth')
+    trainer.train()
 
 if __name__ == '__main__':
     main()

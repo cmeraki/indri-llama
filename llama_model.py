@@ -126,24 +126,22 @@ def sample_top_p(probs, p):
     return next_token
 
 class Attention(nn.Module):
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, args: LlamaConfig):
         super().__init__()
-        self.n_kv_heads = config.n_kv_heads
-        self.n_heads = config.n_heads
-        self.head_dim = config.dim // config.n_heads
-        self.n_rep = self.n_heads // self.n_kv_heads
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        model_parallel_size = 1 # AK: model parallel size is 1 for 1 GPU
+        self.n_local_heads = args.n_heads // model_parallel_size
+        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = args.dim // args.n_heads
 
-        self.wq = nn.Linear(config.dim, config.n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(config.n_heads * self.head_dim, config.dim, bias=False)
+        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False )
+        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
-        self.cache_k = torch.zeros(
-            (config.max_batch_size, config.max_seq_len, self.n_kv_heads, self.head_dim)
-        ).cuda()
-        self.cache_v = torch.zeros(
-            (config.max_batch_size, config.max_seq_len, self.n_kv_heads, self.head_dim)
-        ).cuda()
+        self.cache_k = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim)).cuda()
+        self.cache_v = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim)).cuda()
 
     def forward(
         self,
@@ -153,12 +151,13 @@ class Attention(nn.Module):
         mask: Optional[torch.Tensor],
     ):
         bsz, seqlen, _ = x.shape
+
+        # QKV
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-        
-        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
-        
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        # rotate QK (rope)
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
         if start_pos >= 0:
@@ -169,33 +168,23 @@ class Attention(nn.Module):
             keys = self.cache_k[:bsz, : start_pos + seqlen]
             values = self.cache_v[:bsz, : start_pos + seqlen]
         else:
-            keys, values = xk, xv
+            keys = xk
+            values = xv
 
-        keys = repeat_kv(keys, self.n_rep)
-        values = repeat_kv(values, self.n_rep)
+        # repeat k/v heads if n_kv_heads < n_heads (GQA)
+        keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
 
-        xq = xq.transpose(1, 2).reshape(bsz * self.n_heads, seqlen, self.head_dim)
-        keys = keys.transpose(1, 2).reshape(bsz * self.n_heads, seqlen, self.head_dim)
-        values = values.transpose(1, 2).reshape(bsz * self.n_heads, seqlen, self.head_dim)
-        
-        scores = torch.matmul(xq, keys.transpose(1, 2)) / math.sqrt(self.head_dim)
-        
+        # attention
+        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
-            if mask.ndim == 2:
-                mask = mask.unsqueeze(1).unsqueeze(1)  
-            elif mask.ndim == 3:
-                mask = mask.unsqueeze(1)  
-            mask = mask.repeat(1, self.n_heads, 1, 1) 
-            if mask.shape[-1] < scores.shape[-1]:
-                mask = F.pad(mask, (0, scores.shape[-1] - mask.shape[-1]))
-            elif mask.shape[-1] > scores.shape[-1]:
-                mask = mask[..., :scores.shape[-1]]
-            scores = scores + mask
-
+            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)
-        
-        output = output.view(bsz, self.n_heads, seqlen, self.head_dim).transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
 class FeedForward(nn.Module):
@@ -371,7 +360,7 @@ class Llama(nn.Module):
             'llama-7b': dict(n_layers=32, dim=4096, n_heads=32),
             'llama-13b': dict(n_layers=40, dim=5120, n_heads=40),
             'llama-33b': dict(n_layers=60, dim=6656, n_heads=52),
-            'llama-1b': dict(n_layers=12, dim=1024, n_heads=16),
+            'llama-1b': dict(n_layers=12, dim=2048, n_heads=16),
         }
 
         assert model_type in config_args, f"Unsupported model type: {model_type}"
