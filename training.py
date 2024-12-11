@@ -1,265 +1,238 @@
+import os
+import time
+import math
+import json
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
-import pickle
+import random
 import numpy as np
-from llama_model import get_model
-import gc
+from pathlib import Path
+import torch.nn.functional as F
+import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
+from torch.utils.data import Dataset, DataLoader
+from torch.distributed.optim import ZeroRedundancyOptimizer
+from torch.utils.checkpoint import checkpoint
 
-class TrainingConfig:
-    def __init__(
-        self, 
-        batch_size=16,  
-        grad_accumulation_steps=4,
-        learning_rate=1e-4, 
-        weight_decay=0.01,
-        epochs=1000,
-        max_grad_norm=1.0,
-        warmup_steps=100,
-        log_interval=100,
-        checkpoint_path='Llama_tokenizer/model.safetensors'
-    ):
-        self.batch_size = batch_size
-        self.grad_accumulation_steps = grad_accumulation_steps
-        self.learning_rate = learning_rate
-        self.weight_decay = weight_decay
-        self.epochs = epochs
-        self.max_grad_norm = max_grad_norm
-        self.warmup_steps = warmup_steps
-        self.log_interval = log_interval
-        self.checkpoint_path = checkpoint_path
-
-class AudioTokenDataset(Dataset):
-    def __init__(self, data):
-        self.data = data
+class TokenDataset(Dataset):
+    def __init__(self, tokens_file, block_size=2048):
+        self.tokens = torch.load(tokens_file, map_location='cpu')
+        self.block_size = block_size
         
+        self.TEXT_START_TOKEN = 128000  
+        self.TASK_TOKEN = 144642
+        self.SPEAKER_TOKEN = 144645
+        self.AUDIO_START_TOKEN = 144641
+        self.STOP_TOKEN = 144644
+
     def __len__(self):
-        return len(self.data)
-    
+        return len(self.tokens)
+
     def __getitem__(self, idx):
-        return self.data[idx]
+        full_sequence = self.tokens[idx]
+        
+        audio_start_idx = torch.where(full_sequence == self.AUDIO_START_TOKEN)[0]
+        
+        if len(audio_start_idx) == 0:
+            raise ValueError("Audio start token not found in the sequence")
+        
+        audio_start_idx = audio_start_idx[0]
+        
+        if full_sequence.size(0) > self.block_size:
+            full_sequence = full_sequence[:self.block_size]
+        
+        x = full_sequence.clone()
+        y = full_sequence.clone()
+        
+        metadata = {
+            'text_tokens': full_sequence[:audio_start_idx].tolist(),
+            'audio_tokens': full_sequence[audio_start_idx+1:].tolist(),
+            'task_token_pos': torch.where(full_sequence == self.TASK_TOKEN)[0][0] if self.TASK_TOKEN in full_sequence else -1,
+            'speaker_token_pos': torch.where(full_sequence == self.SPEAKER_TOKEN)[0][0] if self.SPEAKER_TOKEN in full_sequence else -1
+        }
+        
+        return x, y, metadata
 
-def prepare_data(pkl_path, test_split=0.1, val_split=0.1):
-    with open(pkl_path, 'rb') as f:
-        all_tokens = pickle.load(f)
+def get_lr(it, warmup_iters=2000, lr_decay_iters=300000, min_lr=1e-6, learning_rate=6e-4):
+    if it < warmup_iters:
+        return learning_rate * it / warmup_iters
+    if it > lr_decay_iters:
+        return min_lr
     
-    all_tokens = torch.tensor(all_tokens, dtype=torch.long, device='cpu')
-    
-    total_size = len(all_tokens)
-    test_size = int(total_size * test_split)
-    val_size = int(total_size * val_split)
-    train_size = total_size - test_size - val_size
-    
-    torch.manual_seed(42)
-    indices = torch.randperm(total_size)
-    
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:train_size+val_size]
-    test_indices = indices[train_size+val_size:]
-    
-    return {
-        'train': AudioTokenDataset(all_tokens[train_indices]),
-        'val': AudioTokenDataset(all_tokens[val_indices]),
-        'test': AudioTokenDataset(all_tokens[test_indices])
-    }
+    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (learning_rate - min_lr)
 
-def create_batch_collate(start_token=128000, audio_start_token=144461, stop_token=144644):
-    def collate_fn(batch):
-        def find_special_token_indices(sequence):
-            try:
-                audio_start_idx = torch.where(sequence == audio_start_token)[0][0]
-                stop_idx = torch.where(sequence == stop_token)[0][0]
-                return audio_start_idx, stop_idx
-            except IndexError:
-                print("Warning: Special tokens not found in sequence")
-                return None, None
+class MultimodalTrainer:
+    def __init__(self, 
+                 model, 
+                 tokens_file, 
+                 out_dir='./out', 
+                 batch_size=2,  
+                 block_size=2048, 
+                 learning_rate=6e-4,
+                 grad_accum_steps=128,  
+                 steps=100000):
         
-        processed_sequences = []
-        targets = []
+        self.ddp = int(os.environ.get('RANK', -1)) != -1
         
-        for sequence in batch:
-            audio_start_idx, stop_idx = find_special_token_indices(sequence)
-            
-            if audio_start_idx is None or stop_idx is None:
-                continue
-            
-            input_seq = sequence[:audio_start_idx+1]
-            target_seq = sequence[audio_start_idx+1:stop_idx]
-            
-            processed_sequences.append(input_seq)
-            targets.append(target_seq)
+        if self.ddp:
+            init_process_group(backend='nccl')
+            self.ddp_rank = int(os.environ['RANK'])
+            self.ddp_local_rank = int(os.environ['LOCAL_RANK'])
+            self.ddp_world_size = int(os.environ['WORLD_SIZE'])
+            self.device = f'cuda:{self.ddp_local_rank}'
+            torch.cuda.set_device(self.device)
+            self.master_process = self.ddp_rank == 0
+        else:
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.master_process = True
+            self.ddp_world_size = 1
         
-        input_seq_padded = torch.nn.utils.rnn.pad_sequence(
-            processed_sequences, 
-            batch_first=True, 
-            padding_value=0  
+        self.model = model.to(self.device)
+        
+        self.model.enable_gradient_checkpointing()
+        
+        if self.ddp:
+            self.model = DDP(self.model, device_ids=[self.ddp_local_rank], 
+                              gradient_as_bucket_view=True,  
+                              find_unused_parameters=False)
+        
+        self.dataset = TokenDataset(tokens_file, block_size=block_size)
+        
+        self.batch_size = batch_size
+        self.block_size = block_size
+        self.steps = steps
+        self.out_dir = out_dir
+        self.learning_rate = learning_rate
+        self.grad_accum_steps = grad_accum_steps
+        
+        self.dataloader = DataLoader(
+            self.dataset, 
+            batch_size=self.batch_size, 
+            shuffle=True, 
+            num_workers=4, 
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2
         )
         
-        target_seq_padded = torch.nn.utils.rnn.pad_sequence(
-            targets, 
-            batch_first=True, 
-            padding_value=-100 
+        self.optimizer = ZeroRedundancyOptimizer(
+            self.model.parameters(),
+            optimizer_class=torch.optim.AdamW,
+            lr=learning_rate,
+            weight_decay=0.1,
+            betas=(0.9, 0.95)
         )
         
-        return input_seq_padded, target_seq_padded
-    
-    return collate_fn
+        self.scaler = torch.cuda.amp.GradScaler(
+            init_scale=2.**16,  
+            growth_factor=2.0,  
+            backoff_factor=0.5,  
+            growth_interval=2000  
+        )
+        
+        os.makedirs(out_dir, exist_ok=True)
 
-def create_learning_rate_scheduler(optimizer, config):
-    return torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.1)
+    def log_memory_usage(self):
+        """Log current GPU memory usage"""
+        if torch.cuda.is_available():
+            print(f"Allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+            print(f"Cached: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
 
-def train_model(
-    model, 
-    dataloaders, 
-    config: TrainingConfig, 
-    device
-):
-    best_val_loss = float('inf')
-    
-    optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=config.learning_rate, 
-        weight_decay=config.weight_decay
-    )
-    
-    lr_scheduler = create_learning_rate_scheduler(optimizer, config)
-    
-    global_step = 0
-    
-    for epoch in range(config.epochs):
-        torch.cuda.empty_cache()
-        gc.collect()
+    def train(self):
+        iter_num = 0
+        best_val_loss = float('inf')
         
-        model.train()
-        train_loss = 0.0
-        optimizer.zero_grad()
+        if self.master_process:
+            print("Starting training with memory optimizations...")
         
-        for batch_idx, (input_features, targets) in enumerate(dataloaders['train']):
-            input_features = input_features.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
-            
-            with torch.cuda.amp.autocast(enabled=True):
-                loss = model.forward_loss(input_features, targets)
-            
-            loss = loss / config.grad_accumulation_steps
-            
-            loss.backward()
-            
-            if (batch_idx + 1) % config.grad_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+        while iter_num < self.steps:
+            for batch_x, batch_y, batch_metadata in self.dataloader:
+                # Dynamic learning rate
+                lr = get_lr(iter_num)
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = lr
                 
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+                batch_x = batch_x.to(self.device)
+                batch_y = batch_y.to(self.device)
                 
-                global_step += 1
-            
-            train_loss += loss.item()
-            
-            del input_features, targets, loss
-            torch.cuda.empty_cache()
-            
-            if batch_idx % config.log_interval == 0:
-                print(f'Epoch {epoch}, Batch {batch_idx}, Train Loss: {train_loss:.4f}')
-        
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for input_features, targets in dataloaders['val']:
-                input_features = input_features.to(device, non_blocking=True)
-                targets = targets.to(device, non_blocking=True)
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    logits, loss = self.model(batch_x, batch_y)
                 
-                loss = model.forward_loss(input_features, targets)
-                val_loss += loss.item()
+                loss = loss / self.grad_accum_steps
                 
-                # Clear GPU memory
-                del input_features, targets, loss
-                torch.cuda.empty_cache()
+                self.scaler.scale(loss).backward()
+                
+                if (iter_num + 1) % self.grad_accum_steps == 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad(set_to_none=True)
+                
+                if self.master_process and iter_num % 500 == 0:
+                    print(f"Step {iter_num}, Loss: {loss.item()}")
+                    self.log_memory_usage()
+                    
+                    checkpoint = {
+                        'model': self.model.module.state_dict() if self.ddp else self.model.state_dict(),
+                        'optimizer': self.optimizer.state_dict(),
+                        'iter': iter_num,
+                        'loss': loss.item()
+                    }
+                    torch.save(checkpoint, f"{self.out_dir}/checkpoint_{iter_num}.pt")
+                
+                iter_num += 1
+                
+                if iter_num >= self.steps:
+                    break
         
-        train_loss /= len(dataloaders['train'])
-        val_loss /= len(dataloaders['val'])
-        
-        print(f'Epoch {epoch}: Train Loss {train_loss:.4f}, Val Loss {val_loss:.4f}')
-        
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if self.master_process:
+            final_model_path = f"{self.out_dir}/final_model.pt"
             torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'train_loss': train_loss,
-                'val_loss': val_loss
-            }, config.checkpoint_path)
+                'model': self.model.module.state_dict() if self.ddp else self.model.state_dict(),
+                'config': self.model.module.config if self.ddp else self.model.config
+            }, final_model_path)
+            print(f"Training completed. Final model saved to {final_model_path}")
         
-    return model
+        if self.ddp:
+            destroy_process_group()
 
 def main():
-    config = TrainingConfig(
-        batch_size=2, 
-        grad_accumulation_steps=64,
-        learning_rate=1e-4,
-        epochs=1000
+    from llama_model import get_model 
+
+    tokens_file = 'tokens/lj_speech_tokens.pkl'  
+    vocab_size = 144645  
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    model = get_model(
+        model_type='llama-1b',
+        vocab_size=vocab_size,
+        dropout=0.1,
+        max_seq_len=2048,
+        bias=False,
+        device=device
+    )
+
+    def enable_gradient_checkpointing(self):
+        for block in self.blocks:
+            block.attn = checkpoint(block.attn)
+            block.mlp = checkpoint(block.mlp)
+    
+    model.enable_gradient_checkpointing = enable_gradient_checkpointing.__get__(model)
+
+    trainer = MultimodalTrainer(
+        model=model, 
+        tokens_file=tokens_file, 
+        batch_size=2,  
+        block_size=2048, 
+        steps=100000,
+        grad_accum_steps=128  
     )
     
-    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    with torch.cuda.amp.autocast(enabled=True):
-        model = get_model(
-            model_type='llama',
-            path='Llama_tokenizer/model.safetensors',
-            device=str(DEVICE),
-            audio_feature_dim=128  
-        )
-    model.to(DEVICE)
-    
-    datasets = prepare_data('tokens/lj_speech_tokens.pkl')
-    
-    dataloaders = {
-        'train': DataLoader(
-            datasets['train'], 
-            batch_size=config.batch_size, 
-            shuffle=True, 
-            collate_fn=create_batch_collate(),
-            pin_memory=True, 
-            num_workers=2     
-        ),
-        'val': DataLoader(
-            datasets['val'], 
-            batch_size=config.batch_size, 
-            shuffle=False, 
-            collate_fn=create_batch_collate(),
-            pin_memory=True
-        ),
-        'test': DataLoader(
-            datasets['test'], 
-            batch_size=config.batch_size, 
-            shuffle=False, 
-            collate_fn=create_batch_collate(),
-            pin_memory=True
-        )
-    }
-    
-    model.gradient_checkpointing_enable()
-    
-    trained_model = train_model(
-        model, 
-        dataloaders, 
-        config, 
-        DEVICE
-    )
-    
-    trained_model.eval()
-    test_loss = 0.0
-    with torch.no_grad():
-        for input_features, targets in dataloaders['test']:
-            input_features = input_features.to(DEVICE)
-            targets = targets.to(DEVICE)
-            
-            loss = trained_model.forward_loss(input_features, targets)
-            test_loss += loss.item()
-        
-    print(f'Final Test Loss: {test_loss / len(dataloaders["test"]):.4f}')
+    trainer.train()
 
 if __name__ == '__main__':
     main()

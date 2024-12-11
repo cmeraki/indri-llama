@@ -77,33 +77,12 @@ def apply_scaling(freqs: torch.Tensor):
             new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
     return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
-    if use_scaled:
-        freqs = apply_scaling(freqs)
-    freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  
-    return freqs_cis
-
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     ndim = x.ndim
     assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1]), f"Expected shape {(x.shape[1], x.shape[-1])}, but got {freqs_cis.shape}"
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
-
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     bs, slen, n_kv_heads, head_dim = x.shape
@@ -124,6 +103,14 @@ def sample_top_p(probs, p):
     next_token = torch.multinomial(probs_sort, num_samples=1)
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
+
+def apply_rotary_emb(xq, xk, freqs_cis):
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
 
 class Attention(nn.Module):
     def __init__(self, args: LlamaConfig):
@@ -158,7 +145,7 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         # rotate QK (rope)
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
 
         if start_pos >= 0:
             self.cache_k = self.cache_k.to(xq)
@@ -272,30 +259,26 @@ class Llama(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def precompute_freqs_cis(self, dim, max_seq_len, base=10000.0, use_scaled_rope=False):
-        """
-        Precompute rotary position embeddings (frequencies)
-        """
         freqs = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         t = torch.arange(max_seq_len).float()
         freqs = torch.outer(t, freqs)
         
         # Compute sin and cos 
-        emb = torch.cat([freqs.sin(), freqs.cos()], dim=-1)
+        emb = freqs.sin()+freqs.cos()/2
         
         # Optional scaling for RoPE
         if use_scaled_rope:
             scaling_factor = 1.0 / math.sqrt(2)
             emb *= scaling_factor
         
+        # Ensure the second dimension matches the expected shape
+        emb = emb.view(max_seq_len, -1, 2).reshape(max_seq_len, -1)
+        
         # Store as buffer so it moves with the model
         self.register_buffer('freqs_cis', emb, persistent=False)
         return emb
-
+    
     def _prepare_rotary_embeddings(self, h, seqlen):
-        """
-        Prepare rotary embeddings for the current sequence
-        """
-        # Ensure freqs_cis is available and of correct size
         if not hasattr(self, 'freqs_cis') or self.freqs_cis is None:
             self.precompute_freqs_cis(
                 self.config.dim // self.config.n_heads, 
@@ -303,8 +286,6 @@ class Llama(nn.Module):
                 self.config.rope_theta,
                 self.config.use_scaled_rope
             )
-        
-        # Slice or recompute frequencies if needed
         if self.freqs_cis.size(0) < seqlen:
             self.precompute_freqs_cis(
                 self.config.dim // self.config.n_heads, 
@@ -312,14 +293,15 @@ class Llama(nn.Module):
                 self.config.rope_theta,
                 self.config.use_scaled_rope
             )
-        
         return self.freqs_cis[:seqlen].to(h.device)
 
-    def forward_loss(self, inputs: torch.Tensor, targets: torch.Tensor, ignore_index=0, attention_mask: Optional[torch.Tensor] = None):
+    
+    def forward_loss(self, inputs: torch.Tensor, targets: torch.Tensor, ignore_index=-100, attention_mask: Optional[torch.Tensor] = None):
         inputs = inputs.to(self.tok_embeddings.weight.device)
         targets = targets.to(self.tok_embeddings.weight.device)
-
-        _bsz, seqlen = inputs.shape        
+    
+        _bsz, seqlen = inputs.shape
+        
         h = self.tok_embeddings(inputs)        
         
         # Dynamically prepare rotary embeddings
@@ -339,13 +321,15 @@ class Llama(nn.Module):
             
             # Combine masks
             mask = mask + attention_mask[:, :, :seqlen, :seqlen]
-
+    
         start_pos = 0
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
         
         h = self.norm(h)
         logits = self.output(h).float()
+        
+        print(f"Logits shape: {logits.shape}, Targets shape: {targets.shape}")
         
         loss = F.cross_entropy(
             input=logits.view(-1, logits.size(-1)), 
@@ -355,7 +339,6 @@ class Llama(nn.Module):
         
         return loss
 
-    # ... (rest of the methods remain the same)
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):        
         param_dict = {pn: p for pn, p in self.named_parameters()}

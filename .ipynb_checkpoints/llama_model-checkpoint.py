@@ -77,33 +77,12 @@ def apply_scaling(freqs: torch.Tensor):
             new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
     return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
-    if use_scaled:
-        freqs = apply_scaling(freqs)
-    freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  
-    return freqs_cis
-
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     ndim = x.ndim
     assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1]), f"Expected shape {(x.shape[1], x.shape[-1])}, but got {freqs_cis.shape}"
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
-
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     bs, slen, n_kv_heads, head_dim = x.shape
@@ -125,25 +104,31 @@ def sample_top_p(probs, p):
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
 
+def apply_rotary_emb(xq, xk, freqs_cis):
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
 class Attention(nn.Module):
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, args: LlamaConfig):
         super().__init__()
-        self.n_kv_heads = config.n_kv_heads
-        self.n_heads = config.n_heads
-        self.head_dim = config.dim // config.n_heads
-        self.n_rep = self.n_heads // self.n_kv_heads
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        model_parallel_size = 1 # AK: model parallel size is 1 for 1 GPU
+        self.n_local_heads = args.n_heads // model_parallel_size
+        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = args.dim // args.n_heads
 
-        self.wq = nn.Linear(config.dim, config.n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(config.n_heads * self.head_dim, config.dim, bias=False)
+        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False )
+        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
-        self.cache_k = torch.zeros(
-            (config.max_batch_size, config.max_seq_len, self.n_kv_heads, self.head_dim)
-        ).cuda()
-        self.cache_v = torch.zeros(
-            (config.max_batch_size, config.max_seq_len, self.n_kv_heads, self.head_dim)
-        ).cuda()
+        self.cache_k = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim)).cuda()
+        self.cache_v = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim)).cuda()
 
     def forward(
         self,
@@ -153,13 +138,14 @@ class Attention(nn.Module):
         mask: Optional[torch.Tensor],
     ):
         bsz, seqlen, _ = x.shape
+
+        # QKV
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-        
-        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
-        
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        # rotate QK (rope)
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
 
         if start_pos >= 0:
             self.cache_k = self.cache_k.to(xq)
@@ -169,22 +155,22 @@ class Attention(nn.Module):
             keys = self.cache_k[:bsz, : start_pos + seqlen]
             values = self.cache_v[:bsz, : start_pos + seqlen]
         else:
-            keys, values = xk, xv
+            keys = xk
+            values = xv
 
-        keys = repeat_kv(keys, self.n_rep)
-        values = repeat_kv(values, self.n_rep)
+        # repeat k/v heads if n_kv_heads < n_heads (GQA)
+        keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
 
-        xq = xq.transpose(1, 2)
-        keys = keys.transpose(1, 2)
-        values = values.transpose(1, 2)
-        
+        # attention
+        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
-            scores = scores + mask
-        
+            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)
-        
+        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
@@ -255,11 +241,11 @@ class Llama(nn.Module):
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
-        self.freqs_cis = precompute_freqs_cis(
+        self.precompute_freqs_cis(
             config.dim // config.n_heads,
             config.max_seq_len * 2,
             config.rope_theta,
-            config.use_scaled_rope,
+            config.use_scaled_rope
         )
 
         self.apply(self._init_weights)
@@ -272,46 +258,78 @@ class Llama(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward_inference(self, tokens: torch.Tensor, start_pos: int):
-        _bsz, seqlen = tokens.shape
-        h = self.tok_embeddings(tokens)
-        self.freqs_cis = self.freqs_cis.to(h.device)
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+    def precompute_freqs_cis(self, dim, max_seq_len, base=10000.0, use_scaled_rope=False):
+        freqs = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_seq_len).float()
+        freqs = torch.outer(t, freqs)
+        
+        # Compute sin and cos 
+        emb = freqs.sin()+freqs.cos()/2
+        
+        # Optional scaling for RoPE
+        if use_scaled_rope:
+            scaling_factor = 1.0 / math.sqrt(2)
+            emb *= scaling_factor
+        
+        # Ensure the second dimension matches the expected shape
+        emb = emb.view(max_seq_len, -1, 2).reshape(max_seq_len, -1)
+        
+        # Store as buffer so it moves with the model
+        self.register_buffer('freqs_cis', emb, persistent=False)
+        return emb
+    
+    def _prepare_rotary_embeddings(self, h, seqlen):
+        if not hasattr(self, 'freqs_cis') or self.freqs_cis is None:
+            self.precompute_freqs_cis(
+                self.config.dim // self.config.n_heads, 
+                max(seqlen, self.config.max_seq_len), 
+                self.config.rope_theta,
+                self.config.use_scaled_rope
+            )
+        if self.freqs_cis.size(0) < seqlen:
+            self.precompute_freqs_cis(
+                self.config.dim // self.config.n_heads, 
+                seqlen * 2, 
+                self.config.rope_theta,
+                self.config.use_scaled_rope
+            )
+        return self.freqs_cis[:seqlen].to(h.device)
 
-        mask = None
-        if seqlen > 1:
-            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
-            mask = torch.triu(mask, diagonal=1)
-            mask = torch.hstack(
-                [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
-            ).type_as(h)
-
-        for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
-        h = self.norm(h)
-        output = self.output(h).float()
-        return output
-
-    def forward_loss(self, inputs: torch.Tensor, targets: torch.Tensor, ignore_index=-100):
+    
+    def forward_loss(self, inputs: torch.Tensor, targets: torch.Tensor, ignore_index=-100, attention_mask: Optional[torch.Tensor] = None):
         inputs = inputs.to(self.tok_embeddings.weight.device)
         targets = targets.to(self.tok_embeddings.weight.device)
-
-        _bsz, seqlen = inputs.shape        
+    
+        _bsz, seqlen = inputs.shape
+        
         h = self.tok_embeddings(inputs)        
-        if not hasattr(self, 'freqs_cis') or self.freqs_cis is None:           
-            self.freqs_cis = self.precompute_freqs_cis(seqlen, h.size(-1)).to(h.device)
         
-        freqs_cis = self.freqs_cis[:seqlen].to(h.device)        
-        mask = torch.full((seqlen, seqlen), float("-inf"), device=h.device)
-        mask = torch.triu(mask, diagonal=1)
-        mask = mask.type_as(h)
+        # Dynamically prepare rotary embeddings
+        freqs_cis = self._prepare_rotary_embeddings(h, seqlen)
         
+        # Create causal mask
+        mask = torch.triu(torch.full((seqlen, seqlen), float('-inf'), device=h.device), diagonal=1)
+        
+        # If attention_mask is provided, combine it with the causal mask
+        if attention_mask is not None:
+            # Ensure attention_mask is broadcastable
+            if attention_mask.ndim == 2:
+                attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
+            
+            # Convert attention mask to the same type as the causal mask
+            attention_mask = attention_mask.to(mask.dtype)
+            
+            # Combine masks
+            mask = mask + attention_mask[:, :, :seqlen, :seqlen]
+    
         start_pos = 0
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
         
         h = self.norm(h)
         logits = self.output(h).float()
+        
+        print(f"Logits shape: {logits.shape}, Targets shape: {targets.shape}")
         
         loss = F.cross_entropy(
             input=logits.view(-1, logits.size(-1)), 
@@ -321,14 +339,6 @@ class Llama(nn.Module):
         
         return loss
 
-    def precompute_freqs_cis(self, max_seq_len, dim, base=10000.0):
-        freqs = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        t = torch.arange(max_seq_len).float()
-        freqs = torch.outer(t, freqs)
-        
-        emb = torch.cat([freqs.sin(), freqs.cos()], dim=-1)
-        
-        return emb
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):        
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -362,31 +372,25 @@ class Llama(nn.Module):
         """
         from transformers import LlamaForCausalLM
 
-        # Define model configurations (example, adjust as needed)
         config_args = {
             'llama-7b': dict(n_layers=32, dim=4096, n_heads=32),
             'llama-13b': dict(n_layers=40, dim=5120, n_heads=40),
             'llama-33b': dict(n_layers=60, dim=6656, n_heads=52),
-            'llama-1b': dict(n_layers=12, dim=1024, n_heads=16),
-            # Add more model types as needed
+            'llama-1b': dict(n_layers=12, dim=2048, n_heads=16),
         }
 
         assert model_type in config_args, f"Unsupported model type: {model_type}"
 
-        # Create configuration
-        config_args[model_type]['vocab_size'] = 32000  # Typical Llama vocab size
-        config_args[model_type]['max_seq_len'] = 2048  # Typical sequence length
+        config_args[model_type]['vocab_size'] = 32000  
+        config_args[model_type]['max_seq_len'] = 2048  
         config = LlamaConfig(**config_args[model_type])
 
-        # Create model
         model = cls(config)
 
-        # Load HuggingFace model
         model_hf = LlamaForCausalLM.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
         sd = model.state_dict()
 
-        # Mapping and copying weights (simplified, may need adjustments)
         for k, v in sd_hf.items():
             if k in sd:
                 sd[k].copy_(v)
@@ -454,11 +458,13 @@ def get_model(
         dropout=0.0,
         max_seq_len=2048,
         bias=False,
-        device='cpu',
+        device=None,
         compile=True,
         path=None
     ):
-
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
     config_args = {
         'llama-7b': dict(
             n_layers=32, 
@@ -486,7 +492,7 @@ def get_model(
         ),
         'llama-1b': dict(
             n_layers=12,
-            dim=1024,  
+            dim=2048,  
             n_heads=16,   
             rope_theta=10000.0,
             norm_eps=1e-5,
@@ -522,11 +528,9 @@ def get_model(
 
     model = Llama(llamaconf)
 
-    # Load weights if path is provided
     if path:
         state_dict = checkpoint['model']
         
-        # Remove any unwanted prefixes (common in distributed training)
         unwanted_prefix = '_orig_mod.'
         for k, v in list(state_dict.items()):
             if k.startswith(unwanted_prefix):
