@@ -7,16 +7,19 @@ import random
 import numpy as np
 from pathlib import Path
 import torch.nn.functional as F
+import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from torch.utils.data import Dataset, DataLoader
+from torch.distributed.optim import ZeroRedundancyOptimizer
+from torch.utils.checkpoint import checkpoint
 
 class TokenDataset(Dataset):
     def __init__(self, tokens_file, block_size=2048):
-        self.tokens = torch.load(tokens_file)
+        self.tokens = torch.load(tokens_file, map_location='cpu')
         self.block_size = block_size
         
-        self.TEXT_START_TOKEN = 128000  # Adjust as needed
+        self.TEXT_START_TOKEN = 128000  
         self.TASK_TOKEN = 144642
         self.SPEAKER_TOKEN = 144645
         self.AUDIO_START_TOKEN = 144641
@@ -26,10 +29,8 @@ class TokenDataset(Dataset):
         return len(self.tokens)
 
     def __getitem__(self, idx):
-        # Get the full token sequence
         full_sequence = self.tokens[idx]
         
-        # Find the positions of key tokens
         audio_start_idx = torch.where(full_sequence == self.AUDIO_START_TOKEN)[0]
         
         if len(audio_start_idx) == 0:
@@ -37,15 +38,12 @@ class TokenDataset(Dataset):
         
         audio_start_idx = audio_start_idx[0]
         
-        # Prepare input and target sequences
         if full_sequence.size(0) > self.block_size:
             full_sequence = full_sequence[:self.block_size]
         
-        # The entire sequence is used for both input and target
         x = full_sequence.clone()
         y = full_sequence.clone()
         
-        # Additional metadata for potential use
         metadata = {
             'text_tokens': full_sequence[:audio_start_idx].tolist(),
             'audio_tokens': full_sequence[audio_start_idx+1:].tolist(),
@@ -70,10 +68,10 @@ class MultimodalTrainer:
                  model, 
                  tokens_file, 
                  out_dir='./out', 
-                 batch_size=4, 
+                 batch_size=2,  
                  block_size=2048, 
                  learning_rate=6e-4,
-                 grad_accum_steps=64,
+                 grad_accum_steps=128,  
                  steps=100000):
         
         self.ddp = int(os.environ.get('RANK', -1)) != -1
@@ -92,10 +90,15 @@ class MultimodalTrainer:
             self.ddp_world_size = 1
         
         self.model = model.to(self.device)
-        self.dataset = TokenDataset(tokens_file, block_size=block_size)
+        
+        self.model.enable_gradient_checkpointing()
         
         if self.ddp:
-            self.model = DDP(self.model, device_ids=[self.ddp_local_rank])
+            self.model = DDP(self.model, device_ids=[self.ddp_local_rank], 
+                              gradient_as_bucket_view=True,  
+                              find_unused_parameters=False)
+        
+        self.dataset = TokenDataset(tokens_file, block_size=block_size)
         
         self.batch_size = batch_size
         self.block_size = block_size
@@ -109,25 +112,44 @@ class MultimodalTrainer:
             batch_size=self.batch_size, 
             shuffle=True, 
             num_workers=4, 
-            pin_memory=True
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2
         )
         
-        self.optimizer = self.model.module.configure_optimizers(
-            weight_decay=0.1, 
-            learning_rate=learning_rate, 
-            betas=(0.9, 0.95), 
-            device=self.device
+        self.optimizer = ZeroRedundancyOptimizer(
+            self.model.parameters(),
+            optimizer_class=torch.optim.AdamW,
+            lr=learning_rate,
+            weight_decay=0.1,
+            betas=(0.9, 0.95)
         )
-        self.scaler = torch.cuda.amp.GradScaler(enabled=True)
+        
+        self.scaler = torch.cuda.amp.GradScaler(
+            init_scale=2.**16,  
+            growth_factor=2.0,  
+            backoff_factor=0.5,  
+            growth_interval=2000  
+        )
         
         os.makedirs(out_dir, exist_ok=True)
+
+    def log_memory_usage(self):
+        """Log current GPU memory usage"""
+        if torch.cuda.is_available():
+            print(f"Allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+            print(f"Cached: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
 
     def train(self):
         iter_num = 0
         best_val_loss = float('inf')
         
+        if self.master_process:
+            print("Starting training with memory optimizations...")
+        
         while iter_num < self.steps:
             for batch_x, batch_y, batch_metadata in self.dataloader:
+                # Dynamic learning rate
                 lr = get_lr(iter_num)
                 for param_group in self.optimizer.param_groups:
                     param_group['lr'] = lr
@@ -135,7 +157,7 @@ class MultimodalTrainer:
                 batch_x = batch_x.to(self.device)
                 batch_y = batch_y.to(self.device)
                 
-                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                     logits, loss = self.model(batch_x, batch_y)
                 
                 loss = loss / self.grad_accum_steps
@@ -150,8 +172,9 @@ class MultimodalTrainer:
                     self.scaler.update()
                     self.optimizer.zero_grad(set_to_none=True)
                 
-                if self.master_process and iter_num % 1000 == 0:
+                if self.master_process and iter_num % 500 == 0:
                     print(f"Step {iter_num}, Loss: {loss.item()}")
+                    self.log_memory_usage()
                     
                     checkpoint = {
                         'model': self.model.module.state_dict() if self.ddp else self.model.state_dict(),
@@ -182,7 +205,7 @@ def main():
 
     tokens_file = 'tokens/lj_speech_tokens.pkl'  
     vocab_size = 144645  
-    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     model = get_model(
         model_type='llama-1b',
@@ -193,12 +216,20 @@ def main():
         device=device
     )
 
+    def enable_gradient_checkpointing(self):
+        for block in self.blocks:
+            block.attn = checkpoint(block.attn)
+            block.mlp = checkpoint(block.mlp)
+    
+    model.enable_gradient_checkpointing = enable_gradient_checkpointing.__get__(model)
+
     trainer = MultimodalTrainer(
         model=model, 
         tokens_file=tokens_file, 
-        batch_size=4, 
+        batch_size=2,  
         block_size=2048, 
-        steps=100000
+        steps=100000,
+        grad_accum_steps=128  
     )
     
     trainer.train()

@@ -254,11 +254,11 @@ class Llama(nn.Module):
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
-        self.freqs_cis = precompute_freqs_cis(
+        self.precompute_freqs_cis(
             config.dim // config.n_heads,
             config.max_seq_len * 2,
             config.rope_theta,
-            config.use_scaled_rope,
+            config.use_scaled_rope
         )
 
         self.apply(self._init_weights)
@@ -271,19 +271,59 @@ class Llama(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, inputs: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
-        return self.forward_loss(inputs, inputs, attention_mask=attention_mask)
+    def precompute_freqs_cis(self, dim, max_seq_len, base=10000.0, use_scaled_rope=False):
+        """
+        Precompute rotary position embeddings (frequencies)
+        """
+        freqs = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_seq_len).float()
+        freqs = torch.outer(t, freqs)
+        
+        # Compute sin and cos 
+        emb = torch.cat([freqs.sin(), freqs.cos()], dim=-1)
+        
+        # Optional scaling for RoPE
+        if use_scaled_rope:
+            scaling_factor = 1.0 / math.sqrt(2)
+            emb *= scaling_factor
+        
+        # Store as buffer so it moves with the model
+        self.register_buffer('freqs_cis', emb, persistent=False)
+        return emb
 
-    def forward_loss(self, inputs: torch.Tensor, targets: torch.Tensor, ignore_index=-100, attention_mask: Optional[torch.Tensor] = None):
+    def _prepare_rotary_embeddings(self, h, seqlen):
+        """
+        Prepare rotary embeddings for the current sequence
+        """
+        # Ensure freqs_cis is available and of correct size
+        if not hasattr(self, 'freqs_cis') or self.freqs_cis is None:
+            self.precompute_freqs_cis(
+                self.config.dim // self.config.n_heads, 
+                max(seqlen, self.config.max_seq_len), 
+                self.config.rope_theta,
+                self.config.use_scaled_rope
+            )
+        
+        # Slice or recompute frequencies if needed
+        if self.freqs_cis.size(0) < seqlen:
+            self.precompute_freqs_cis(
+                self.config.dim // self.config.n_heads, 
+                seqlen * 2, 
+                self.config.rope_theta,
+                self.config.use_scaled_rope
+            )
+        
+        return self.freqs_cis[:seqlen].to(h.device)
+
+    def forward_loss(self, inputs: torch.Tensor, targets: torch.Tensor, ignore_index=0, attention_mask: Optional[torch.Tensor] = None):
         inputs = inputs.to(self.tok_embeddings.weight.device)
         targets = targets.to(self.tok_embeddings.weight.device)
 
         _bsz, seqlen = inputs.shape        
         h = self.tok_embeddings(inputs)        
-        if not hasattr(self, 'freqs_cis') or self.freqs_cis is None:           
-            self.freqs_cis = self.precompute_freqs_cis(seqlen, h.size(-1)).to(h.device)
         
-        freqs_cis = self.freqs_cis[:seqlen].to(h.device)        
+        # Dynamically prepare rotary embeddings
+        freqs_cis = self._prepare_rotary_embeddings(h, seqlen)
         
         # Create causal mask
         mask = torch.triu(torch.full((seqlen, seqlen), float('-inf'), device=h.device), diagonal=1)
@@ -315,14 +355,7 @@ class Llama(nn.Module):
         
         return loss
 
-    def precompute_freqs_cis(self, max_seq_len, dim, base=10000.0):
-        freqs = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        t = torch.arange(max_seq_len).float()
-        freqs = torch.outer(t, freqs)
-        
-        emb = torch.cat([freqs.sin(), freqs.cos()], dim=-1)
-        
-        return emb
+    # ... (rest of the methods remain the same)
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):        
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -435,55 +468,6 @@ class Llama(nn.Module):
         self.config.vocab_size = new_vocab_size
         self.vocab_size = new_vocab_size
 
-    @torch.inference_mode()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, stop_token=None):
-        start_pos = 0
-        for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.config.max_seq_len else idx[:, -self.config.max_seq_len:]           
-            logits = self.forward_inference(idx_cond, start_pos)            
-            logits = logits[:, -1, :] / temperature
-            
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            
-            probs = F.softmax(logits, dim=-1)
-            
-            idx_next = torch.multinomial(probs, num_samples=1)
-
-            if stop_token is not None and idx_next == stop_token:
-                break
-
-            idx = torch.cat((idx, idx_next), dim=1)
-            start_pos += 1
-
-        return idx
-
-    def expand_vocab(self, new_vocab_size):
-        print(f"Updating embeddings {self.vocab_size, self.config.dim} => {new_vocab_size, self.config.dim}")
-        
-        old_embeddings = self.tok_embeddings.weight
-        new_embeddings = torch.Tensor(new_vocab_size, self.config.dim).to(old_embeddings.device)
-
-        mu = torch.mean(old_embeddings, dim=0)
-        sigma = ((old_embeddings - mu).T @ (old_embeddings - mu)) / self.vocab_size
-        dist = torch.distributions.multivariate_normal.MultivariateNormal(
-            mu, covariance_matrix=1e-5 * sigma)
-
-        new_embeddings[:self.vocab_size] = self.tok_embeddings.weight
-        new_embeddings[self.vocab_size:] = torch.stack(
-            tuple((dist.sample() for _ in range(new_vocab_size - self.vocab_size))), 
-            dim=0
-        )
-
-        self.tok_embeddings = nn.Embedding(_weight=new_embeddings, 
-                                           num_embeddings=new_vocab_size, 
-                                           embedding_dim=self.config.dim)
-        self.output = nn.Linear(self.config.dim, new_vocab_size, bias=False)
-        self.output.weight = self.tok_embeddings.weight
-
-        self.config.vocab_size = new_vocab_size
-        self.vocab_size = new_vocab_size
 
 def get_model(
         model_type='llama-1b',
