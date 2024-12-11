@@ -150,8 +150,8 @@ class Attention(nn.Module):
         if start_pos >= 0:
             self.cache_k = self.cache_k.to(xq)
             self.cache_v = self.cache_v.to(xq)
-            self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-            self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+            self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk.detach()
+            self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv.detach()
             keys = self.cache_k[:bsz, : start_pos + seqlen]
             values = self.cache_v[:bsz, : start_pos + seqlen]
         else:
