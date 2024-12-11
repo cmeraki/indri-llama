@@ -65,7 +65,7 @@ def get_vocab_size(tokens_file):
     max_token_in_data = max(max(seq) for seq in tokens)
     return max_token_in_data + 1
 
-def train_model(model, dataloader, optimizer, num_epochs=10):
+def train_model(model, dataloader, optimizer, num_epochs=1000, save_interval=1000):
     model.train()
     device = next(model.parameters()).device
   
@@ -83,7 +83,9 @@ def train_model(model, dataloader, optimizer, num_epochs=10):
             total_loss += loss.item()
         
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {total_loss/len(dataloader):.4f}")        
-        torch.save(model.state_dict(), f"llama_model_epoch_{epoch+1}.pth")
+        
+        if (epoch + 1) % save_interval == 0 or (epoch + 1) == num_epochs:
+            torch.save(model.state_dict(), f"llama_model_epoch_{epoch+1}.pth")
 
 def main():
     tokens_file = 'tokens/lj_speech_tokens.pkl'
@@ -129,7 +131,7 @@ def main():
     
     torch.autograd.set_detect_anomaly(True)
     
-    train_model(model, dataloader, optimizer, num_epochs=10)
+    train_model(model, dataloader, optimizer, num_epochs=10, save_interval=10)
 
 if __name__ == "__main__":
     main()
