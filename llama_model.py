@@ -328,9 +328,7 @@ class Llama(nn.Module):
         
         h = self.norm(h)
         logits = self.output(h).float()
-        
-        print(f"Logits shape: {logits.shape}, Targets shape: {targets.shape}")
-        
+                
         loss = F.cross_entropy(
             input=logits.view(-1, logits.size(-1)), 
             target=targets.view(-1), 
