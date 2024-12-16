@@ -412,14 +412,10 @@ class Llama(nn.Module):
 
     @torch.inference_mode()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, stop_token=None):
-        """
-        Generate sequence with similar logic to GPT generation method
-        Adapted for Llama's specific forward methods
-        """
         start_pos = 0
         for _ in range(max_new_tokens):
             idx_cond = idx if idx.size(1) <= self.config.max_seq_len else idx[:, -self.config.max_seq_len:]           
-            logits = self.forward_inference(idx_cond, start_pos)            
+            logits = self.forward(idx_cond, start_pos, self.freqs_cis[:idx_cond.size(1)], None)            
             logits = logits[:, -1, :] / temperature
             
             if top_k is not None:
