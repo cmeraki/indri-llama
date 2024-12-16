@@ -256,10 +256,11 @@ class Llama(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None
     ):
         h = self.tok_embeddings(x)
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+            h = layer(h, start_pos, freqs_cis, mask, attention_mask)
         h = self.norm(h)
         out = self.output(h)
         return out
@@ -342,7 +343,7 @@ class Llama(nn.Module):
     
         start_pos = 0
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+            h = layer(h, start_pos, freqs_cis, mask, attention_mask)
         
         h = self.norm(h)
         logits = self.output(h).float()
