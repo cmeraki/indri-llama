@@ -57,7 +57,7 @@ class MimiTokenizer:
 
     def decode(self, tokens):
         assert len(tokens.shape) == 2
-        tokens = torch.tensor(np.expand_dims(tokens, axis=0)).to(self.device)
+        tokens = torch.tensor(np.expand_dims(tokens, axis=0), dtype=torch.long).to(self.device)
         output = self.model.decode(tokens)
         waveform = output.audio_values.cpu()
         return waveform
