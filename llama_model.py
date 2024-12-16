@@ -257,8 +257,11 @@ class Llama(nn.Module):
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
-        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
-        out = h + self.feed_forward(self.ffn_norm(h))
+        h = self.tok_embeddings(x)
+        for layer in self.layers:
+            h = layer(h, start_pos, freqs_cis, mask)
+        h = self.norm(h)
+        out = self.output(h)
         return out
     
     def forward_inference(self, idx_cond, start_pos):
