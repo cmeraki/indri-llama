@@ -89,8 +89,7 @@ def train_model(model, dataloader, optimizer, num_epochs=1000, save_interval=100
 
 def main():
     tokens_file = 'tokens/lj_speech_tokens.pkl'
-    max_token = 144641  
-    
+    max_token = 144645   
     vocab_size = get_vocab_size(tokens_file)
     print(f"Detected Vocabulary Size: {vocab_size}")
     
@@ -131,7 +130,7 @@ def main():
     
     torch.autograd.set_detect_anomaly(True)
     
-    train_model(model, dataloader, optimizer, num_epochs=10, save_interval=10)
+    train_model(model, dataloader, optimizer, num_epochs=100, save_interval=100)
 
 if __name__ == "__main__":
     main()
