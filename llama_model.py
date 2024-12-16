@@ -250,6 +250,21 @@ class Llama(nn.Module):
 
         self.apply(self._init_weights)
 
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ):
+        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+        out = h + self.feed_forward(self.ffn_norm(h))
+        return out
+    
+    def forward_inference(self, idx_cond, start_pos):
+        logits = self.forward(idx_cond)
+        return logits
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
