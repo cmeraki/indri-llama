@@ -220,9 +220,13 @@ class TransformerBlock(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None
     ):
-        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
-        out = h + self.feed_forward(self.ffn_norm(h))
+        h = self.tok_embeddings(x)
+        for layer in self.layers:
+            h = layer(h, start_pos, freqs_cis, mask, attention_mask)
+        h = self.norm(h)
+        out = self.output(h)
         return out
 
 class Llama(nn.Module):
