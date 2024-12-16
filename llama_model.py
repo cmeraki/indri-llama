@@ -220,13 +220,9 @@ class TransformerBlock(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
-        attention_mask: Optional[torch.Tensor] = None
     ):
-        h = self.tok_embeddings(x)
-        for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask, attention_mask)
-        h = self.norm(h)
-        out = self.output(h)
+        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+        out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
 class Llama(nn.Module):
@@ -260,13 +256,9 @@ class Llama(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
-        attention_mask: Optional[torch.Tensor] = None
     ):
-        h = self.tok_embeddings(x)
-        for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask, attention_mask)
-        h = self.norm(h)
-        out = self.output(h)
+        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+        out = h + self.feed_forward(self.ffn_norm(h))
         return out
     
     def forward_inference(self, idx_cond, start_pos):
@@ -347,7 +339,7 @@ class Llama(nn.Module):
     
         start_pos = 0
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask, attention_mask)
+            h = layer(h, start_pos, freqs_cis, mask)
         
         h = self.norm(h)
         logits = self.output(h).float()
@@ -420,10 +412,14 @@ class Llama(nn.Module):
 
     @torch.inference_mode()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, stop_token=None):
+        """
+        Generate sequence with similar logic to GPT generation method
+        Adapted for Llama's specific forward methods
+        """
         start_pos = 0
         for _ in range(max_new_tokens):
             idx_cond = idx if idx.size(1) <= self.config.max_seq_len else idx[:, -self.config.max_seq_len:]           
-            logits = self.forward(idx_cond, start_pos, self.freqs_cis[:idx_cond.size(1)], None)            
+            logits = self.forward_inference(idx_cond, start_pos)            
             logits = logits[:, -1, :] / temperature
             
             if top_k is not None:
