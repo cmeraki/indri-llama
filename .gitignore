@@ -7,4 +7,4 @@ oldtokenizer/
 tts_tokenizer/
 tokens/
 llama_tokenizer
-llama_model_epoch_100.pth
+models/

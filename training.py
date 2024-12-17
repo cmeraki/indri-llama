@@ -118,9 +118,6 @@ def train_model(
                 optimizer.zero_grad()
             
             total_loss += loss.item()
-            
-            del targets, attention_mask, loss
-            torch.cuda.empty_cache()
         
         if gradient_accumulation_steps > 1:
             optimizer.step()
@@ -176,7 +173,7 @@ def run_distributed_training(rank, num_gpus, dataset, config):
     
     dataloader = DataLoader(
         train_dataset, 
-        batch_size=32 // num_gpus,  
+        batch_size=48 // num_gpus,  
         shuffle=False, 
         sampler=train_sampler,
         collate_fn=collate_fn,
@@ -188,7 +185,7 @@ def run_distributed_training(rank, num_gpus, dataset, config):
     torch.manual_seed(42 + rank)
     model = Llama(config).to(rank)
     
-    pre_trained_weights = 'llama_model_epoch_100.pth'
+    pre_trained_weights = ''
     try:
         state_dict = torch.load(pre_trained_weights, map_location=f'cuda:{rank}', weights_only=True)
         model.load_state_dict(state_dict)
@@ -200,7 +197,7 @@ def run_distributed_training(rank, num_gpus, dataset, config):
     
     optimizer = model.configure_optimizers(
         weight_decay=0.01, 
-        learning_rate=5e-5,  
+        learning_rate=1e-5,  
         betas=(0.9, 0.95), 
         device_type='cuda'
     )
@@ -213,7 +210,7 @@ def run_distributed_training(rank, num_gpus, dataset, config):
         model, 
         dataloader, 
         optimizer, 
-        num_epochs=100, 
+        num_epochs=1000, 
         save_interval=100,
         gradient_accumulation_steps=8
     )
