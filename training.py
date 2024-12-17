@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 class TokenDataset(Dataset):
-    def __init__(self, tokens_file, max_token=144641):
+    def __init__(self, tokens_file, max_token=144645):
         with open(tokens_file, 'rb') as f:
             all_tokens = pickle.load(f)
         
@@ -114,7 +114,7 @@ def main():
     torch.manual_seed(42)  
     model = Llama(config).cuda()
     
-    pre_trained_weights = 'path_to_pretrained_weights.pth'
+    pre_trained_weights = 'llama_model_epoch_100.pth'
     try:
         model.load_state_dict(torch.load(pre_trained_weights))
         print("Loaded pre-trained weights.")

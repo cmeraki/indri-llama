@@ -122,13 +122,34 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
-        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False )
+        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
-        self.cache_k = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim)).cuda()
-        self.cache_v = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim)).cuda()
+        # Initially create cache, but we'll handle resizing dynamically
+        self.max_batch_size = args.max_batch_size
+        self.max_seq_len = args.max_seq_len
+        self.cache_k = torch.zeros((self.max_batch_size, self.max_seq_len, self.n_local_kv_heads, self.head_dim)).cuda()
+        self.cache_v = torch.zeros((self.max_batch_size, self.max_seq_len, self.n_local_kv_heads, self.head_dim)).cuda()
+
+    def _resize_cache(self, new_seq_len):
+        # If new sequence length exceeds current cache size, resize
+        if new_seq_len > self.max_seq_len:
+            # Create new cache with larger sequence length
+            new_cache_k = torch.zeros((self.max_batch_size, new_seq_len, self.n_local_kv_heads, self.head_dim), 
+                                       device=self.cache_k.device)
+            new_cache_v = torch.zeros((self.max_batch_size, new_seq_len, self.n_local_kv_heads, self.head_dim), 
+                                       device=self.cache_v.device)
+            
+            # Copy existing cache content
+            new_cache_k[:, :self.max_seq_len] = self.cache_k
+            new_cache_v[:, :self.max_seq_len] = self.cache_v
+            
+            # Update cache and max sequence length
+            self.cache_k = new_cache_k
+            self.cache_v = new_cache_v
+            self.max_seq_len = new_seq_len
 
     def forward(
         self,
@@ -139,24 +160,26 @@ class Attention(nn.Module):
     ):
         bsz, seqlen, _ = x.shape
 
+        # Resize cache if needed
+        total_seq_len = start_pos + seqlen
+        self._resize_cache(total_seq_len)
+
         # QKV
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        
         # rotate QK (rope)
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
 
-        if start_pos >= 0:
-            self.cache_k = self.cache_k.to(xq)
-            self.cache_v = self.cache_v.to(xq)
-            self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk.detach()
-            self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv.detach()
-            keys = self.cache_k[:bsz, : start_pos + seqlen]
-            values = self.cache_v[:bsz, : start_pos + seqlen]
-        else:
-            keys = xk
-            values = xv
+        # Update cache
+        self.cache_k = self.cache_k.to(xq)
+        self.cache_v = self.cache_v.to(xq)
+        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk.detach()
+        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv.detach()
+        keys = self.cache_k[:bsz, : start_pos + seqlen]
+        values = self.cache_v[:bsz, : start_pos + seqlen]
 
         # repeat k/v heads if n_kv_heads < n_heads (GQA)
         keys = repeat_kv(keys, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
@@ -166,9 +189,32 @@ class Attention(nn.Module):
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         values = values.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        
+        # Ensure mask has compatible dimensions
         if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            # Ensure mask matches the last dimension of scores
+            if mask.ndim == 2:
+                mask = mask.unsqueeze(0).unsqueeze(0)
+            
+            # Ensure mask has the same number of dimensions as scores
+            while mask.ndim < scores.ndim:
+                mask = mask.unsqueeze(0)
+            
+            # Ensure mask's last two dimensions match scores
+            if mask.shape[-2:] != scores.shape[-2:]:
+                # Slice or pad the mask to match scores
+                if mask.shape[-2] > scores.shape[-2]:
+                    mask = mask[..., :scores.shape[-2], :scores.shape[-1]]
+                else:
+                    # Create a new mask with the correct dimensions
+                    new_mask = torch.full(scores.shape[-2:], float('-inf'), device=scores.device)
+                    new_mask[:mask.shape[-2], :mask.shape[-1]] = mask
+                    mask = new_mask.unsqueeze(0).unsqueeze(0)
+            
+            scores = scores + mask
+        
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)

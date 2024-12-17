@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 class TokenDataset(Dataset):
-    def __init__(self, tokens_file, max_token=144641):
+    def __init__(self, tokens_file, max_token=144645):
         with open(tokens_file, 'rb') as f:
             all_tokens = pickle.load(f)
         
@@ -89,8 +89,7 @@ def train_model(model, dataloader, optimizer, num_epochs=1000, save_interval=100
 
 def main():
     tokens_file = 'tokens/lj_speech_tokens.pkl'
-    max_token = 144641  
-    
+    max_token = 144645   
     vocab_size = get_vocab_size(tokens_file)
     print(f"Detected Vocabulary Size: {vocab_size}")
     
@@ -115,7 +114,7 @@ def main():
     torch.manual_seed(42)  
     model = Llama(config).cuda()
     
-    pre_trained_weights = 'path_to_pretrained_weights.pth'
+    pre_trained_weights = 'llama_model_epoch_100.pth'
     try:
         model.load_state_dict(torch.load(pre_trained_weights))
         print("Loaded pre-trained weights.")
@@ -131,7 +130,7 @@ def main():
     
     torch.autograd.set_detect_anomaly(True)
     
-    train_model(model, dataloader, optimizer, num_epochs=10, save_interval=10)
+    train_model(model, dataloader, optimizer, num_epochs=100, save_interval=100)
 
 if __name__ == "__main__":
     main()
