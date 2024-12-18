@@ -57,7 +57,7 @@ class MimiTokenizer:
 
     def decode(self, tokens):
         assert len(tokens.shape) == 2
-        tokens = torch.tensor(np.expand_dims(tokens, axis=0)).to(self.device)
+        tokens = torch.tensor(np.expand_dims(tokens, axis=0), dtype=torch.long).to(self.device)
         output = self.model.decode(tokens)
         waveform = output.audio_values.cpu()
         return waveform
@@ -105,11 +105,13 @@ if __name__ == '__main__':
     librispeech_dummy = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
     librispeech_dummy = librispeech_dummy.cast_column("audio", Audio(sampling_rate=tokenizer.sampling_rate))
     audio_sample = librispeech_dummy[-1]["audio"]["array"]
-    print(audio_sample.shape)
+    print("Audio tokens", audio_sample.shape)
     from tqdm import tqdm
     for i in tqdm(range(10000)):
         tokens = tokenizer.encode(audio_sample)
-    print(tokens.shape)
+        break
+        
+    print("tokens" ,tokens.shape)
 
     audio = tokenizer.decode(tokens)
     print(audio)
